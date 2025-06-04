@@ -13,7 +13,9 @@
 // limitations under the License.
 
 mod activations;
+mod attn_mask_utils; // Added line
 
 fn main() {
     println!("Hello, Hugging Face Transformers in Rust!");
+    // Potentially add a call to a test/example for expand_mask if desired for demonstration
 }
