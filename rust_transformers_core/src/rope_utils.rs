@@ -12,6 +12,45 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Struct for Default RoPE parameters
+#[derive(Debug, Clone, Copy)]
+pub struct DefaultRopeScalingParams {
+    pub base: f64,
+    pub dim: usize,
+}
+
+// Struct for Linear Scaling RoPE parameters
+#[derive(Debug, Clone, Copy)]
+pub struct LinearRopeScalingParams {
+    pub base: f64,
+    pub dim: usize,
+    pub factor: f64,
+}
+
+// Struct for Dynamic NTK RoPE parameters
+#[derive(Debug, Clone, Copy)]
+pub struct DynamicNtkRopeScalingParams {
+    pub original_base: f64,
+    pub dim: usize,
+    pub max_position_embeddings: usize,
+    pub factor: f64,
+    pub current_seq_len: usize,
+}
+
+// YarnParams struct (should already be defined from previous work)
+// LongRopeParams struct (should already be defined from previous work)
+
+// Enum to encapsulate parameters for different RoPE scaling types
+#[derive(Debug, Clone)]
+pub enum RopeParams {
+    Default(DefaultRopeScalingParams),
+    Linear(LinearRopeScalingParams),
+    DynamicNtk(DynamicNtkRopeScalingParams),
+    Yarn(YarnParams),        // Assuming YarnParams is already defined and public
+    LongRope(LongRopeParams),  // Assuming LongRopeParams is already defined and public
+}
+
+
 // Module-level helper for comparing f64 vectors with a tolerance
 // Not public, only for use within this module's tests.
 fn assert_vec_approx_eq(a: &Vec<f64>, b: &Vec<f64>, tolerance: f64) {
@@ -729,6 +768,82 @@ mod tests {
         compute_longrope_rope_parameters(&params);
     }
 
+    // --- Tests for RoPE Dispatcher ---
+    #[test]
+    fn test_dispatcher_default() {
+        let params = DefaultRopeScalingParams { base: 10000.0, dim: 4 };
+        let (inv_freq_dispatch, factor_dispatch) =
+            compute_rope_parameters(&RopeParams::Default(params));
+        let (inv_freq_direct, factor_direct) =
+            compute_default_rope_parameters(params.base, params.dim);
+
+        assert_vec_approx_eq(&inv_freq_dispatch, &inv_freq_direct, 1e-9);
+        assert_eq!(factor_dispatch, factor_direct);
+    }
+
+    #[test]
+    fn test_dispatcher_linear() {
+        let params = LinearRopeScalingParams { base: 10000.0, dim: 4, factor: 2.0 };
+        let (inv_freq_dispatch, factor_dispatch) =
+            compute_rope_parameters(&RopeParams::Linear(params));
+        let (inv_freq_direct, factor_direct) =
+            compute_linear_scaling_rope_parameters(params.base, params.dim, params.factor);
+
+        assert_vec_approx_eq(&inv_freq_dispatch, &inv_freq_direct, 1e-9);
+        assert_eq!(factor_dispatch, factor_direct);
+    }
+
+    #[test]
+    fn test_dispatcher_dynamic_ntk() {
+        let params = DynamicNtkRopeScalingParams {
+            original_base: 10000.0, dim: 4, max_position_embeddings: 2048,
+            factor: 2.0, current_seq_len: 1024,
+        };
+        let (inv_freq_dispatch, factor_dispatch) =
+            compute_rope_parameters(&RopeParams::DynamicNtk(params));
+        let (inv_freq_direct, factor_direct) =
+            compute_dynamic_ntk_rope_parameters(
+                params.original_base, params.dim, params.max_position_embeddings,
+                params.factor, params.current_seq_len,
+            );
+
+        assert_vec_approx_eq(&inv_freq_dispatch, &inv_freq_direct, 1e-9);
+        assert_eq!(factor_dispatch, factor_direct);
+    }
+
+    #[test]
+    fn test_dispatcher_yarn() {
+        let params_yarn = YarnParams {
+            original_base: 10000.0, dim: 128, scaling_factor: 8.0,
+            original_max_pos_embeddings: 2048, yarn_attn_factor_override: None,
+            mscale: Some(1.0), mscale_all_dim: None, beta_fast: Some(32.0), beta_slow: Some(1.0),
+        };
+        let (inv_freq_dispatch, factor_dispatch) =
+            compute_rope_parameters(&RopeParams::Yarn(params_yarn.clone())); // Clone because p_yarn in dispatcher is &YarnParams
+        let (inv_freq_direct, factor_direct) =
+            compute_yarn_rope_parameters(&params_yarn);
+
+        assert_vec_approx_eq(&inv_freq_dispatch, &inv_freq_direct, 1e-9);
+        assert_eq!(factor_dispatch, factor_direct);
+    }
+
+    #[test]
+    fn test_dispatcher_longrope() {
+        let params_long = LongRopeParams {
+            original_base: 10000.0, dim: 4, config_max_pos_embeddings: 2048,
+            config_original_max_pos_embeddings_override: None,
+            short_factor_list: vec![1.0, 1.0], long_factor_list: vec![2.0, 2.0],
+            rope_scaling_factor_override: Some(1.0), rope_scaling_attn_factor_override: None,
+            current_seq_len: 1024,
+        };
+        let (inv_freq_dispatch, factor_dispatch) =
+            compute_rope_parameters(&RopeParams::LongRope(params_long.clone())); // Clone for same reason
+        let (inv_freq_direct, factor_direct) =
+            compute_longrope_rope_parameters(&params_long);
+
+        assert_vec_approx_eq(&inv_freq_dispatch, &inv_freq_direct, 1e-9);
+        assert_eq!(factor_dispatch, factor_direct);
+    }
 
     // --- Tests for apply_rotary_pos_emb (moved into this mod tests) ---
     #[test]
