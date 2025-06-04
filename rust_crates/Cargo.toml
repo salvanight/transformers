@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "tensor_ops_rs",
+]
+
+# Optional: Define default resolver version for the workspace
+resolver = "2"

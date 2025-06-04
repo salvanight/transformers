@@ -1,0 +1,14 @@
+[package]
+name = "tensor_ops_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "tensor_ops_rs_py" # Name of the output library file (e.g., tensor_ops_rs_py.so)
+crate-type = ["cdylib"]  # Critical for Python extensions
+
+[dependencies]
+pyo3 = { version = "0.21.0", features = ["extension-module"] }
+# Add your preferred Rust tensor library here later, e.g.:
+# ndarray = "0.15"
+# tch = "0.14"

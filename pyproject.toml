@@ -1,60 +1,37 @@
-[tool.coverage.run]
-source = ["transformers"]
-omit = [
-    "*/convert_*",
-    "*/__main__.py"
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "tensor_ops_rs_py" # This is what Python will import
+version = "0.1.0"
+description = "A Python package with Rust extensions for tensor operations."
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: MIT License", # Example, choose your license
+    "Operating System :: OS Independent",
 ]
+# Optional: Add more metadata like authors, readme, license file, etc.
+# authors = [{name = "Your Name", email = "your@email.com"}]
+# readme = "README.md" # Path to your README file
 
-[tool.coverage.report]
-exclude_lines = [
-    "pragma: no cover",
-    "raise",
-    "except",
-    "register_parameter"
-]
+[tool.maturin]
+# This points to the Cargo.toml of the crate that produces the Python module.
+# Essential for projects where the pyproject.toml is not in the same directory as the Rust crate's Cargo.toml,
+# or when using a workspace.
+manifest-path = "rust_crates/tensor_ops_rs/Cargo.toml"
 
-[tool.ruff]
-target-version = "py39"
-line-length = 119
+# The `features` array allows you to enable specific features in your Rust crate.
+# `pyo3/extension-module` is typically needed for PyO3.
+features = ["pyo3/extension-module"]
 
-[tool.ruff.lint]
-# Never enforce `E501` (line length violations).
-ignore = ["C901", "E501", "E741", "F402", "F823" ]
-# RUF013: Checks for the use of implicit Optional
-#  in type annotations when the default parameter value is None.
-select = ["C", "E", "F", "I", "W", "RUF013"]
-
-# Ignore import violations in all `__init__.py` files.
-[tool.ruff.lint.per-file-ignores]
-"__init__.py" = ["E402", "F401", "F403", "F811"]
-"src/transformers/file_utils.py" = ["F401"]
-"src/transformers/utils/dummy_*.py" = ["F401"]
-
-[tool.ruff.lint.isort]
-lines-after-imports = 2
-known-first-party = ["transformers"]
-
-[tool.ruff.format]
-# Like Black, use double quotes for strings.
-quote-style = "double"
-
-# Like Black, indent with spaces, rather than tabs.
-indent-style = "space"
-
-# Like Black, respect magic trailing commas.
-skip-magic-trailing-comma = false
-
-# Like Black, automatically detect the appropriate line ending.
-line-ending = "auto"
-
-[tool.pytest.ini_options]
-addopts = "--doctest-glob='**/*.md'"
-doctest_optionflags="NUMBER NORMALIZE_WHITESPACE ELLIPSIS"
-markers = [
-    "flash_attn_test: marks tests related to flash attention (deselect with '-m \"not flash_attn_test\"')",
-    "bitsandbytes: select (or deselect with `not`) bitsandbytes integration tests",
-    "generate: marks tests that use the GenerationTesterMixin"
-]
-log_cli = 1
-log_cli_level = "WARNING"
-asyncio_default_fixture_loop_scope = "function"
+# Optional: If your Python code is in py_src, you might declare it as a package.
+# This tells maturin to also include Python files from py_src in the wheel.
+# [tool.maturin.bindings.pyo3] # This section is if you use experimental pyo3 bindings directly
+# Instead, for general Python source, you declare it as a package:
+# We will handle Python packaging separately if `py_src` is meant to be part of the same distributable package.
+# For now, this pyproject.toml is focused on building the Rust extension `tensor_ops_rs_py`.
+# If `py_src` is the main Python application that *uses* this Rust extension,
+# it might have its own pyproject.toml or be managed differently.
+# Assuming `tensor_ops_rs_py` is the primary distributable module built here.
