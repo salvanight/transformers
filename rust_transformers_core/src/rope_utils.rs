@@ -92,6 +92,72 @@ pub fn compute_linear_scaling_rope_parameters(
     (inv_freq, attention_factor)
 }
 
+// Calculates inverse frequencies for RoPE with dynamic NTK scaling.
+//
+// Args:
+//   original_base: The initial base value (theta).
+//   dim: The dimensionality of rotary embeddings. Must be an even number and > 2.
+//   max_position_embeddings: The pre-training maximum sequence length. Must be > 0.
+//   scaling_factor: The NTK scaling factor. Must be positive.
+//   current_seq_len: The current sequence length.
+//
+// Returns:
+//   A tuple containing:
+//     - A Vec<f64> of scaled inverse frequencies, shape [dim / 2].
+//     - An f64 representing the attention scaling factor (always 1.0).
+// Panics if dim is not an even number, dim <= 2, max_position_embeddings is 0,
+// scaling_factor is not positive, or the NTK scaling term `ntk_alpha` becomes non-positive.
+pub fn compute_dynamic_ntk_rope_parameters(
+    original_base: f64,
+    dim: usize,
+    max_position_embeddings: usize,
+    scaling_factor: f64,
+    current_seq_len: usize,
+) -> (Vec<f64>, f64) {
+    if dim <= 2 || dim % 2 != 0 {
+        // compute_default_rope_parameters would panic for 0 or odd.
+        // Explicitly panic for dim <= 2 as NTK formula's exponent is problematic.
+        panic!("Dimension for RoPE NTK scaling must be an even number greater than 2, got {}.", dim);
+    }
+    if max_position_embeddings == 0 {
+        panic!("max_position_embeddings must be positive, got 0.");
+    }
+    if scaling_factor <= 0.0 {
+        panic!("scaling_factor must be positive, got {}.", scaling_factor);
+    }
+
+    let eff_seq_len_for_scaling = if current_seq_len > max_position_embeddings {
+        current_seq_len
+    } else {
+        max_position_embeddings
+    };
+
+    let eff_seq_len_f64 = eff_seq_len_for_scaling as f64;
+    let mpe_f64 = max_position_embeddings as f64;
+    let dim_f64 = dim as f64;
+
+    let base_scaled;
+    if eff_seq_len_for_scaling == max_position_embeddings {
+        // If current_seq_len <= max_position_embeddings, ntk_alpha becomes 1.0, so base_scaled is original_base.
+        base_scaled = original_base;
+    } else {
+        let ntk_alpha = (scaling_factor * eff_seq_len_f64 / mpe_f64) - (scaling_factor - 1.0);
+        if ntk_alpha <= 0.0 {
+            panic!("NTK scaling alpha term must be positive, got {}. Check inputs: scaling_factor={}, current_seq_len={}, max_position_embeddings={}",
+                    ntk_alpha, scaling_factor, current_seq_len, max_position_embeddings);
+        }
+        let exponent_val = dim_f64 / (dim_f64 - 2.0);
+        base_scaled = original_base * ntk_alpha.powf(exponent_val);
+    }
+
+    if base_scaled <= 0.0 {
+            panic!("Calculated scaled base must be positive, got {}. original_base={}, scaling_factor={}, current_seq_len={}, max_position_embeddings={}",
+                base_scaled, original_base, scaling_factor, current_seq_len, max_position_embeddings);
+    }
+
+    compute_default_rope_parameters(base_scaled, dim)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; // Imports functions from the parent module (rope_utils)
@@ -211,6 +277,87 @@ mod tests {
         // This panic comes from the internal call to compute_default_rope_parameters
         compute_linear_scaling_rope_parameters(10000.0, 3, 2.0);
     }
+
+    #[test]
+    fn test_compute_dynamic_ntk_rope_parameters_no_scaling() {
+        // When current_seq_len <= max_position_embeddings, base should not change
+        let original_base = 10000.0;
+        let dim = 4;
+        let max_pos = 2048;
+        let scaling_factor = 2.0;
+        let current_seq_len = 1024;
+
+        let (ntk_inv_freq, ntk_att_factor) = compute_dynamic_ntk_rope_parameters(
+            original_base,
+            dim,
+            max_pos,
+            scaling_factor,
+            current_seq_len,
+        );
+        let (default_inv_freq, default_att_factor) =
+            compute_default_rope_parameters(original_base, dim);
+
+        assert_vec_approx_eq(&ntk_inv_freq, &default_inv_freq, 1e-9);
+        assert_eq!(ntk_att_factor, default_att_factor);
+    }
+
+    #[test]
+    fn test_compute_dynamic_ntk_rope_parameters_with_scaling() {
+        let original_base = 10000.0;
+        let dim = 4; // dim must be > 2
+        let max_pos = 2048;
+        let scaling_factor = 2.0;
+        let current_seq_len = 4096; // current_seq_len > max_pos
+
+        let (ntk_inv_freq, ntk_att_factor) = compute_dynamic_ntk_rope_parameters(
+            original_base,
+            dim,
+            max_pos,
+            scaling_factor,
+            current_seq_len,
+        );
+
+        let eff_seq_len_f64 = current_seq_len as f64;
+        let mpe_f64 = max_pos as f64;
+        let dim_f64 = dim as f64;
+
+        let ntk_alpha = (scaling_factor * eff_seq_len_f64 / mpe_f64) - (scaling_factor - 1.0);
+        let exponent_val = dim_f64 / (dim_f64 - 2.0);
+        let expected_base_scaled = original_base * ntk_alpha.powf(exponent_val);
+
+        let (expected_inv_freq, expected_att_factor) =
+            compute_default_rope_parameters(expected_base_scaled, dim);
+
+        assert_vec_approx_eq(&ntk_inv_freq, &expected_inv_freq, 1e-9);
+        assert_eq!(ntk_att_factor, expected_att_factor);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension for RoPE NTK scaling must be an even number greater than 2, got 2.")]
+    fn test_dynamic_ntk_panic_dim_too_small() {
+        compute_dynamic_ntk_rope_parameters(10000.0, 2, 2048, 2.0, 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension for RoPE NTK scaling must be an even number greater than 2, got 3.")]
+    fn test_dynamic_ntk_panic_dim_odd() {
+        compute_dynamic_ntk_rope_parameters(10000.0, 3, 2048, 2.0, 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "max_position_embeddings must be positive, got 0.")]
+    fn test_dynamic_ntk_panic_zero_max_pos() {
+        compute_dynamic_ntk_rope_parameters(10000.0, 4, 0, 2.0, 1024);
+    }
+
+    #[test]
+    #[should_panic(expected = "scaling_factor must be positive, got 0.")]
+    fn test_dynamic_ntk_panic_zero_scaling_factor() {
+        compute_dynamic_ntk_rope_parameters(10000.0, 4, 2048, 0.0, 1024);
+    }
+    // Removed test_dynamic_ntk_panic_non_positive_alpha as the condition for ntk_alpha <= 0
+    // was found to be unreachable given other input constraints (scaling_factor > 0 implies ntk_alpha > 1
+    // when current_seq_len > max_position_embeddings).
 }
 
 #[test]
