@@ -60,6 +60,38 @@ pub fn compute_default_rope_parameters(
     (inv_freq, 1.0)
 }
 
+// Calculates inverse frequencies for RoPE with linear scaling.
+//
+// Args:
+//   base: The base value for RoPE calculations (theta).
+//   dim: The dimensionality of the rotary embeddings. Must be an even number.
+//   scaling_factor: The factor by which to scale the inverse frequencies.
+//                   Must be positive.
+//
+// Returns:
+//   A tuple containing:
+//     - A Vec<f64> of scaled inverse frequencies, with shape [dim / 2].
+//     - An f64 representing the attention scaling factor (always 1.0).
+// Panics if dim is not an even number, if dim is 0 (via an internal call),
+// or if scaling_factor is not positive.
+pub fn compute_linear_scaling_rope_parameters(
+    base: f64,
+    dim: usize,
+    scaling_factor: f64,
+) -> (Vec<f64>, f64) {
+    if scaling_factor <= 0.0 {
+        panic!("scaling_factor must be positive, got {}.", scaling_factor);
+    }
+
+    let (mut inv_freq, attention_factor) = compute_default_rope_parameters(base, dim);
+
+    for val in inv_freq.iter_mut() {
+        *val /= scaling_factor;
+    }
+
+    (inv_freq, attention_factor)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*; // Imports functions from the parent module (rope_utils)
@@ -133,6 +165,51 @@ mod tests {
     #[should_panic(expected = "Dimension for RoPE must be an even number, got 3.")]
     fn test_panic_dim_odd() {
         compute_default_rope_parameters(10000.0, 3);
+    }
+
+    #[test]
+    fn test_compute_linear_scaling_rope_parameters_basic() {
+        let base = 10000.0;
+        let dim = 4;
+        let scaling_factor = 2.0;
+        let (scaled_inv_freq, scaling_att_factor) =
+            compute_linear_scaling_rope_parameters(base, dim, scaling_factor);
+
+        let (expected_default_inv_freq, _) = compute_default_rope_parameters(base, dim);
+        let expected_scaled_inv_freq: Vec<f64> = expected_default_inv_freq
+            .iter()
+            .map(|&x| x / scaling_factor)
+            .collect();
+
+        assert_vec_approx_eq(&scaled_inv_freq, &expected_scaled_inv_freq, 1e-9);
+        assert_eq!(scaling_att_factor, 1.0);
+        assert_eq!(scaled_inv_freq.len(), dim / 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "scaling_factor must be positive, got 0.")]
+    fn test_compute_linear_scaling_rope_panic_zero_factor() {
+        compute_linear_scaling_rope_parameters(10000.0, 4, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "scaling_factor must be positive, got -1.5")]
+    fn test_compute_linear_scaling_rope_panic_negative_factor() {
+        compute_linear_scaling_rope_parameters(10000.0, 4, -1.5);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension for RoPE cannot be 0.")]
+    fn test_compute_linear_scaling_rope_panic_dim_zero() {
+        // This panic comes from the internal call to compute_default_rope_parameters
+        compute_linear_scaling_rope_parameters(10000.0, 0, 2.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Dimension for RoPE must be an even number, got 3.")]
+    fn test_compute_linear_scaling_rope_panic_dim_odd() {
+        // This panic comes from the internal call to compute_default_rope_parameters
+        compute_linear_scaling_rope_parameters(10000.0, 3, 2.0);
     }
 }
 
