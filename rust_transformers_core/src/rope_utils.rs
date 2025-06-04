@@ -61,6 +61,104 @@ pub fn compute_linear_scaling_rope_parameters(
     (inv_freq, attention_factor)
 }
 
+#[derive(Debug, Clone)]
+pub struct LongRopeParams {
+    pub original_base: f64,
+    pub dim: usize,
+    pub config_max_pos_embeddings: usize,
+    pub config_original_max_pos_embeddings_override: Option<usize>,
+    pub short_factor_list: Vec<f64>,
+    pub long_factor_list: Vec<f64>,
+    pub rope_scaling_factor_override: Option<f64>,
+    pub rope_scaling_attn_factor_override: Option<f64>,
+    pub current_seq_len: usize,
+}
+
+pub fn compute_longrope_rope_parameters(
+    params: &LongRopeParams,
+) -> (Vec<f64>, f64) {
+    // Input Validation
+    if params.dim == 0 || params.dim % 2 != 0 {
+        panic!("LongRoPE: Dimension must be an even positive number, got {}.", params.dim);
+    }
+    if params.config_max_pos_embeddings == 0 {
+        panic!("LongRoPE: config_max_pos_embeddings must be positive.");
+    }
+    if let Some(orig_override) = params.config_original_max_pos_embeddings_override {
+        if orig_override == 0 {
+            panic!("LongRoPE: config_original_max_pos_embeddings_override, if Some, must be positive.");
+        }
+    }
+    if params.short_factor_list.len() != params.dim / 2 {
+        panic!("LongRoPE: short_factor_list length must be dim/2. Expected {}, got {}.",
+                params.dim / 2, params.short_factor_list.len());
+    }
+    if params.long_factor_list.len() != params.dim / 2 {
+        panic!("LongRoPE: long_factor_list length must be dim/2. Expected {}, got {}.",
+                params.dim / 2, params.long_factor_list.len());
+    }
+        if params.original_base <= 1.0 && params.dim > 0 {
+        panic!("LongRoPE: original_base must be > 1.0 for log/pow operations, got {}.", params.original_base);
+    }
+
+    // Determine actual_original_max_pos_embeddings and effective_factor
+    let actual_original_max_pos_embeddings = params.config_original_max_pos_embeddings_override
+        .unwrap_or(params.config_max_pos_embeddings);
+
+    if actual_original_max_pos_embeddings == 0 {
+            panic!("LongRoPE: actual_original_max_pos_embeddings resolved to 0, this should not happen.");
+    }
+
+    let effective_factor = if params.config_original_max_pos_embeddings_override.is_some() {
+        (params.config_max_pos_embeddings as f64) / (actual_original_max_pos_embeddings as f64)
+    } else {
+        params.rope_scaling_factor_override.unwrap_or(1.0)
+    };
+
+    // Calculate attention_factor
+    let attention_factor = if let Some(val) = params.rope_scaling_attn_factor_override {
+        val
+    } else {
+        if effective_factor <= 1.0 {
+            1.0
+        } else {
+            if actual_original_max_pos_embeddings <= 1 {
+                1.0
+            } else {
+                (1.0 + (effective_factor.ln() / (actual_original_max_pos_embeddings as f64).ln())).sqrt()
+            }
+        }
+    };
+
+    // Select ext_factors list
+    let ext_factors = if params.current_seq_len > actual_original_max_pos_embeddings {
+        &params.long_factor_list
+    } else {
+        &params.short_factor_list
+    };
+
+    // Calculate inv_freq
+    let dim_half = params.dim / 2;
+    let mut inv_freq = Vec::with_capacity(dim_half);
+    let dim_f64 = params.dim as f64;
+
+    for j in 0..dim_half {
+        let i_f64 = (j * 2) as f64;
+        let exponent_term = i_f64 / dim_f64;
+        let base_powered_term = params.original_base.powf(exponent_term);
+
+        let current_ext_factor = ext_factors[j];
+        if current_ext_factor == 0.0 {
+            panic!("LongRoPE: Factor in ext_factors list cannot be zero at index {}.", j);
+        }
+
+        let val = 1.0 / (current_ext_factor * base_powered_term);
+        inv_freq.push(val);
+    }
+
+    (inv_freq, attention_factor)
+}
+
 pub fn compute_dynamic_ntk_rope_parameters(
     original_base: f64,
     dim: usize,
@@ -517,6 +615,120 @@ mod tests {
         let params = YarnParams { original_base: 1.0, dim: 128, scaling_factor: 1.0, original_max_pos_embeddings: 2048, yarn_attn_factor_override: None, mscale: None, mscale_all_dim: None, beta_fast: None, beta_slow: None };
         compute_yarn_rope_parameters(&params);
     }
+
+    // --- Tests for LongRoPE ---
+    #[test]
+    fn test_compute_longrope_parameters_basic_short() {
+        let dim = 4;
+        let params = LongRopeParams {
+            original_base: 10000.0,
+            dim,
+            config_max_pos_embeddings: 2048,
+            config_original_max_pos_embeddings_override: None,
+            short_factor_list: vec![1.0, 1.0], // dim/2
+            long_factor_list: vec![2.0, 2.0],  // dim/2
+            rope_scaling_factor_override: Some(1.0), // effective_factor = 1.0
+            rope_scaling_attn_factor_override: None,
+            current_seq_len: 1024, // Uses short_factor_list
+        };
+        let (inv_freq, attn_factor) = compute_longrope_rope_parameters(&params);
+
+        let (expected_default, _) = compute_default_rope_parameters(params.original_base, dim);
+        // Since short_factor_list is all 1.0s and effective_factor is 1.0
+        assert_vec_approx_eq(&inv_freq, &expected_default, 1e-9);
+        assert_eq!(attn_factor, 1.0); // effective_factor <= 1.0
+    }
+
+    #[test]
+    fn test_compute_longrope_parameters_basic_long() {
+        let dim = 4;
+        let params = LongRopeParams {
+            original_base: 10000.0,
+            dim,
+            config_max_pos_embeddings: 2048,
+            config_original_max_pos_embeddings_override: None,
+            short_factor_list: vec![1.0, 1.0],
+            long_factor_list: vec![0.5, 0.25],
+            rope_scaling_factor_override: Some(1.0),
+            rope_scaling_attn_factor_override: None,
+            current_seq_len: 4096, // Uses long_factor_list
+        };
+        let (inv_freq, attn_factor) = compute_longrope_rope_parameters(&params);
+
+        let mut expected_inv_freq = Vec::with_capacity(dim/2);
+        let (default_inv_freq, _) = compute_default_rope_parameters(params.original_base, dim);
+        expected_inv_freq.push(default_inv_freq[0] / 0.5);
+        expected_inv_freq.push(default_inv_freq[1] / 0.25);
+
+        assert_vec_approx_eq(&inv_freq, &expected_inv_freq, 1e-9);
+        assert_eq!(attn_factor, 1.0); // effective_factor <= 1.0
+    }
+
+    #[test]
+    fn test_compute_longrope_parameters_with_override_scaling() {
+        let dim = 4;
+        // Here, config_original_max_pos_embeddings_override is Some
+        let params = LongRopeParams {
+            original_base: 10000.0,
+            dim,
+            config_max_pos_embeddings: 4096, // Scaled length
+            config_original_max_pos_embeddings_override: Some(2048), // Original training length
+            short_factor_list: vec![1.0, 1.0],
+            long_factor_list: vec![1.0, 1.0],
+            rope_scaling_factor_override: None, // This will be ignored
+            rope_scaling_attn_factor_override: None,
+            current_seq_len: 1024, // Uses short_factor_list
+        };
+        let (inv_freq, attn_factor) = compute_longrope_rope_parameters(&params);
+
+        // effective_factor = 4096 / 2048 = 2.0
+        // attn_factor = (1 + ln(2.0)/ln(2048))^0.5 = (1 + 0.693147 / 7.624619)^0.5
+        //             = (1 + 0.090909)^0.5 = (1.090909)^0.5 = 1.044465
+        let expected_attn_factor = (1.0 + (2.0f64.ln() / (2048.0f64.ln()))).sqrt();
+        assert!((attn_factor - expected_attn_factor).abs() < 1e-6);
+
+        // inv_freq should be default since short_factor_list is all 1.0s
+        let (expected_default, _) = compute_default_rope_parameters(params.original_base, dim);
+        assert_vec_approx_eq(&inv_freq, &expected_default, 1e-9);
+    }
+
+    #[test]
+    #[should_panic(expected = "LongRoPE: short_factor_list length must be dim/2.")]
+    fn test_longrope_panic_short_factor_len() {
+        let params = LongRopeParams {
+            original_base: 10000.0, dim: 4, config_max_pos_embeddings: 2048,
+            config_original_max_pos_embeddings_override: None,
+            short_factor_list: vec![1.0], // Incorrect length
+            long_factor_list: vec![1.0, 1.0],
+            rope_scaling_factor_override: None, rope_scaling_attn_factor_override: None, current_seq_len: 1024,
+        };
+        compute_longrope_rope_parameters(&params);
+    }
+
+    #[test]
+    #[should_panic(expected = "LongRoPE: Factor in ext_factors list cannot be zero at index 0.")]
+    fn test_longrope_panic_zero_in_ext_factors() {
+        let params = LongRopeParams {
+            original_base: 10000.0, dim: 2, config_max_pos_embeddings: 2048,
+            config_original_max_pos_embeddings_override: None,
+            short_factor_list: vec![0.0], // Zero factor
+            long_factor_list: vec![1.0],
+            rope_scaling_factor_override: None, rope_scaling_attn_factor_override: None, current_seq_len: 1024,
+        };
+        compute_longrope_rope_parameters(&params);
+    }
+
+    #[test]
+    #[should_panic(expected = "LongRoPE: original_base must be > 1.0 for log/pow operations, got 1.")]
+    fn test_longrope_panic_base_le_one() {
+        let params = LongRopeParams {
+            original_base: 1.0, dim: 2, config_max_pos_embeddings: 2048,
+            short_factor_list: vec![1.0], long_factor_list: vec![1.0], current_seq_len: 1024,
+            config_original_max_pos_embeddings_override: None, rope_scaling_factor_override: None, rope_scaling_attn_factor_override: None,
+        };
+        compute_longrope_rope_parameters(&params);
+    }
+
 
     // --- Tests for apply_rotary_pos_emb (moved into this mod tests) ---
     #[test]
