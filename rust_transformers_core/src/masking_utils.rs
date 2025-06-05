@@ -122,27 +122,13 @@ pub fn generate_sliding_window_causal_2d_mask(
         return Vec::new();
     }
 
-    let mut mask = Vec::with_capacity(query_length);
-    let sliding_window_isize = sliding_window as isize;
+    // Refactored implementation:
+    let causal_fn: MaskFunction = Box::new(causal_logic);
+    let window_fn: MaskFunction = sliding_window_logic_fn(sliding_window);
 
-    for q_idx in 0..query_length {
-        let mut row = Vec::with_capacity(key_value_length);
-        let q_idx_isize = q_idx as isize;
-        for kv_idx in 0..key_value_length {
-            let kv_idx_isize = kv_idx as isize;
+    let combined_logic = and_masks_rust(vec![causal_fn, window_fn]);
 
-            let is_causal = kv_idx <= q_idx;
-            let is_within_window = (q_idx_isize - sliding_window_isize) < kv_idx_isize;
-
-            if is_causal && is_within_window {
-                row.push(true);
-            } else {
-                row.push(false);
-            }
-        }
-        mask.push(row);
-    }
-    mask
+    generate_mask_from_logic(query_length, key_value_length, &combined_logic)
 }
 
 pub fn generate_chunked_causal_2d_mask(
@@ -150,34 +136,17 @@ pub fn generate_chunked_causal_2d_mask(
     key_value_length: usize,
     chunk_size: usize,
 ) -> Vec<Vec<bool>> {
-    if chunk_size == 0 {
-        panic!("chunk_size cannot be zero for chunked causal mask generation.");
-    }
-
+    // chunk_size == 0 will be caught by chunked_logic_fn
     if query_length == 0 {
         return Vec::new();
     }
 
-    let mut mask = Vec::with_capacity(query_length);
-    for q_idx in 0..query_length {
-        let mut row = Vec::with_capacity(key_value_length);
-        let q_chunk = q_idx / chunk_size;
+    let causal_fn: MaskFunction = Box::new(causal_logic);
+    let chunk_fn: MaskFunction = chunked_logic_fn(chunk_size); // Panics if chunk_size is 0
 
-        for kv_idx in 0..key_value_length {
-            let kv_chunk = kv_idx / chunk_size;
+    let combined_logic = and_masks_rust(vec![causal_fn, chunk_fn]);
 
-            let is_causal = kv_idx <= q_idx;
-            let is_same_chunk = q_chunk == kv_chunk;
-
-            if is_causal && is_same_chunk {
-                row.push(true);
-            } else {
-                row.push(false);
-            }
-        }
-        mask.push(row);
-    }
-    mask
+    generate_mask_from_logic(query_length, key_value_length, &combined_logic)
 }
 
 pub fn convert_boolean_mask_to_float(
@@ -590,7 +559,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "chunk_size cannot be zero for chunked causal mask generation.")]
+    #[should_panic(expected = "chunk_size cannot be zero for chunked_logic_fn.")]
     fn test_generate_chunked_causal_2d_mask_panic_zero_chunk_size() {
         generate_chunked_causal_2d_mask(3, 3, 0);
     }
@@ -677,12 +646,9 @@ mod tests {
     #[test]
     fn test_sliding_window_logic_fn_behavior() {
         let window_2_logic = sliding_window_logic_fn(2);
-        // q=0: kv > 0-2=-2. kv=0 -> T
         assert_eq!(window_2_logic(0,0,0,0), true);
-        // q=1: kv > 1-2=-1. kv=0 -> T, kv=1 -> T
         assert_eq!(window_2_logic(0,0,1,0), true);
         assert_eq!(window_2_logic(0,0,1,1), true);
-        // q=2: kv > 2-2=0. kv=0 -> F, kv=1 -> T, kv=2 -> T
         assert_eq!(window_2_logic(0,0,2,0), false);
         assert_eq!(window_2_logic(0,0,2,1), true);
         assert_eq!(window_2_logic(0,0,2,2), true);
@@ -691,15 +657,12 @@ mod tests {
     #[test]
     fn test_chunked_logic_fn_behavior() {
         let chunk_2_logic = chunked_logic_fn(2);
-        // q=0,c=0: kv=0,c=0 (T); kv=1,c=0 (T); kv=2,c=1 (F)
         assert_eq!(chunk_2_logic(0,0,0,0), true);
         assert_eq!(chunk_2_logic(0,0,0,1), true);
         assert_eq!(chunk_2_logic(0,0,0,2), false);
-        // q=1,c=0: kv=0,c=0 (T); kv=1,c=0 (T); kv=2,c=1 (F)
         assert_eq!(chunk_2_logic(0,0,1,0), true);
         assert_eq!(chunk_2_logic(0,0,1,1), true);
         assert_eq!(chunk_2_logic(0,0,1,2), false);
-        // q=2,c=1: kv=0,c=0 (F); kv=1,c=0 (F); kv=2,c=1 (T); kv=3,c=1 (T)
         assert_eq!(chunk_2_logic(0,0,2,1), false);
         assert_eq!(chunk_2_logic(0,0,2,2), true);
         assert_eq!(chunk_2_logic(0,0,2,3), true);
@@ -709,70 +672,34 @@ mod tests {
     #[should_panic(expected = "chunk_size cannot be zero for chunked_logic_fn.")]
     fn test_chunked_logic_fn_panic_zero_chunk() {
         let _ = chunked_logic_fn(0);
-        // The panic occurs when the Box is created, not when the closure is called.
-        // To test the panic, we just need to create it.
     }
 
     #[test]
     fn test_and_masks_rust_logic() {
-        // Create new instances instead of cloning for simple test closures
-        let combined_tt = and_masks_rust(vec![
-            Box::new(|_,_,_,_| true),
-            Box::new(|_,_,_,_| true)
-        ]);
+        let combined_tt = and_masks_rust(vec![ Box::new(|_,_,_,_| true), Box::new(|_,_,_,_| true) ]);
         assert_eq!(combined_tt(0,0,0,0), true);
-
-        let combined_tf = and_masks_rust(vec![
-            Box::new(|_,_,_,_| true),
-            Box::new(|_,_,_,_| false)
-        ]);
+        let combined_tf = and_masks_rust(vec![ Box::new(|_,_,_,_| true), Box::new(|_,_,_,_| false) ]);
         assert_eq!(combined_tf(0,0,0,0), false);
-
-        let combined_ft = and_masks_rust(vec![
-            Box::new(|_,_,_,_| false),
-            Box::new(|_,_,_,_| true)
-        ]);
+        let combined_ft = and_masks_rust(vec![ Box::new(|_,_,_,_| false), Box::new(|_,_,_,_| true) ]);
         assert_eq!(combined_ft(0,0,0,0), false);
-
-        let combined_ff = and_masks_rust(vec![
-            Box::new(|_,_,_,_| false),
-            Box::new(|_,_,_,_| false)
-        ]);
+        let combined_ff = and_masks_rust(vec![ Box::new(|_,_,_,_| false), Box::new(|_,_,_,_| false) ]);
         assert_eq!(combined_ff(0,0,0,0), false);
-
         let empty_and = and_masks_rust(vec![]);
-        assert_eq!(empty_and(0,0,0,0), true); // Identity for AND is true
+        assert_eq!(empty_and(0,0,0,0), true);
     }
 
     #[test]
     fn test_or_masks_rust_logic() {
-        // Create new instances instead of cloning
-        let combined_tt = or_masks_rust(vec![
-            Box::new(|_,_,_,_| true),
-            Box::new(|_,_,_,_| true)
-        ]);
+        let combined_tt = or_masks_rust(vec![ Box::new(|_,_,_,_| true), Box::new(|_,_,_,_| true) ]);
         assert_eq!(combined_tt(0,0,0,0), true);
-
-        let combined_tf = or_masks_rust(vec![
-            Box::new(|_,_,_,_| true),
-            Box::new(|_,_,_,_| false)
-        ]);
+        let combined_tf = or_masks_rust(vec![ Box::new(|_,_,_,_| true), Box::new(|_,_,_,_| false) ]);
         assert_eq!(combined_tf(0,0,0,0), true);
-
-        let combined_ft = or_masks_rust(vec![
-            Box::new(|_,_,_,_| false),
-            Box::new(|_,_,_,_| true)
-        ]);
+        let combined_ft = or_masks_rust(vec![ Box::new(|_,_,_,_| false), Box::new(|_,_,_,_| true) ]);
         assert_eq!(combined_ft(0,0,0,0), true);
-
-        let combined_ff = or_masks_rust(vec![
-            Box::new(|_,_,_,_| false),
-            Box::new(|_,_,_,_| false)
-        ]);
+        let combined_ff = or_masks_rust(vec![ Box::new(|_,_,_,_| false), Box::new(|_,_,_,_| false) ]);
         assert_eq!(combined_ff(0,0,0,0), false);
-
         let empty_or = or_masks_rust(vec![]);
-        assert_eq!(empty_or(0,0,0,0), false); // Identity for OR is false
+        assert_eq!(empty_or(0,0,0,0), false);
     }
 
     #[test]
@@ -790,12 +717,7 @@ mod tests {
         let q_len = 4;
         let kv_len = 4;
         let chunk_size = 2;
-
-        // Equivalent to: is_causal AND is_same_chunk
-        let combined_logic = and_masks_rust(vec![
-            Box::new(causal_logic),
-            chunked_logic_fn(chunk_size),
-        ]);
+        let combined_logic = and_masks_rust(vec![ Box::new(causal_logic), chunked_logic_fn(chunk_size) ]);
         let generated = generate_mask_from_logic(q_len, kv_len, &combined_logic);
         let expected = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
         assert_eq!(generated, expected);
@@ -806,11 +728,7 @@ mod tests {
         let q_len = 4;
         let kv_len = 4;
         let window = 2;
-
-        let combined_logic = and_masks_rust(vec![
-            Box::new(causal_logic),
-            sliding_window_logic_fn(window)
-        ]);
+        let combined_logic = and_masks_rust(vec![ Box::new(causal_logic), sliding_window_logic_fn(window) ]);
         let generated = generate_mask_from_logic(q_len, kv_len, &combined_logic);
         let expected = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
         assert_eq!(generated, expected);
