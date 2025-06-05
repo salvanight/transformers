@@ -232,6 +232,46 @@ pub fn generate_sliding_window_causal_2d_mask(
     mask
 }
 
+// Converts a 2D boolean attention mask to a 2D float attention mask.
+//
+// This is often used to prepare a mask for addition to attention scores,
+// where 0.0 allows attention and a large negative number effectively masks it.
+//
+// Args:
+//   bool_mask: A 2D vector of booleans representing the input mask.
+//              `true` values are typically positions to attend to.
+//   false_value: The float value to use for positions where `bool_mask` is `false`.
+//                Typically `std::f64::NEG_INFINITY` or a large negative number.
+//
+// Returns:
+//   A 2D vector `Vec<Vec<f64>>` of the same dimensions as `bool_mask`,
+//   where `true` values from `bool_mask` are converted to `0.0` and
+//   `false` values are converted to `false_value`.
+//   Returns an empty vector if `bool_mask` is empty (i.e., batch size is 0).
+pub fn convert_boolean_mask_to_float(
+    bool_mask: &Vec<Vec<bool>>,
+    false_value: f64,
+) -> Vec<Vec<f64>> {
+    if bool_mask.is_empty() {
+        return Vec::new();
+    }
+
+    let mut float_mask = Vec::with_capacity(bool_mask.len());
+
+    for row_bool in bool_mask.iter() {
+        let mut row_float = Vec::with_capacity(row_bool.len());
+        for &val_bool in row_bool.iter() { // Use &val_bool to get value directly
+            if val_bool {
+                row_float.push(0.0);
+            } else {
+                row_float.push(false_value);
+            }
+        }
+        float_mask.push(row_float);
+    }
+    float_mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -630,6 +670,65 @@ mod tests {
             Vec::<bool>::new(),
         ];
         assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_basic() {
+        let bool_mask = vec![
+            vec![true, false, true],
+            vec![false, true, true],
+        ];
+        let false_val = -10000.0;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        let expected_float_mask = vec![
+            vec![0.0, false_val, 0.0],
+            vec![false_val, 0.0, 0.0],
+        ];
+        assert_eq!(float_mask, expected_float_mask);
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_neg_infinity() {
+        let bool_mask = vec![vec![true, false]];
+        let false_val = std::f64::NEG_INFINITY;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        let expected_float_mask = vec![vec![0.0, false_val]];
+        assert_eq!(float_mask, expected_float_mask);
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_empty_batch() {
+        let bool_mask: Vec<Vec<bool>> = Vec::new();
+        let false_val = -1.0;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        assert!(float_mask.is_empty());
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_empty_rows() {
+        let bool_mask: Vec<Vec<bool>> = vec![Vec::new(), Vec::new()];
+        let false_val = -1.0;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        let expected_float_mask: Vec<Vec<f64>> = vec![Vec::new(), Vec::new()];
+        assert_eq!(float_mask, expected_float_mask);
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_all_true() {
+        let bool_mask = vec![vec![true, true], vec![true, true]];
+        let false_val = std::f64::NEG_INFINITY;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        let expected_float_mask = vec![vec![0.0, 0.0], vec![0.0, 0.0]];
+        assert_eq!(float_mask, expected_float_mask);
+    }
+
+    #[test]
+    fn test_convert_boolean_mask_to_float_all_false() {
+        let bool_mask = vec![vec![false, false], vec![false, false]];
+        let false_val = -99.0;
+        let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
+        let expected_float_mask = vec![vec![false_val, false_val], vec![false_val, false_val]];
+        assert_eq!(float_mask, expected_float_mask);
     }
 }
 // This is the very end of the file. No more characters or lines after this.
