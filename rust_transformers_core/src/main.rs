@@ -13,9 +13,11 @@
 // limitations under the License.
 
 mod activations;
-mod attn_mask_utils;
-mod rope_utils; // Added line
+mod attn_mask_utils; // This was from a previous subtask, might be deprecated/renamed later
+mod rope_utils;
+mod masking_utils; // Added line
 
 fn main() {
     println!("Hello, Hugging Face Transformers in Rust!");
+    // Potentially add a call to a test/example for prepare_padding_mask if desired for demonstration
 }
