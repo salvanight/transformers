@@ -130,6 +130,57 @@ pub fn generate_causal_2d_mask(
     mask
 }
 
+// Generates a 2D chunked causal attention mask.
+//
+// A query at position `q_idx` can attend to keys at positions `kv_idx` if:
+// 1. `kv_idx <= q_idx` (causal condition)
+// 2. `kv_idx / chunk_size == q_idx / chunk_size` (both indices fall within the same chunk).
+//
+// Args:
+//   query_length: The number of queries (rows in the output mask).
+//   key_value_length: The number of keys/values (columns in the output mask).
+//   chunk_size: The size of each chunk. Must be greater than 0.
+//
+// Returns:
+//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
+//   `true` indicates an allowed attention, `false` indicates a masked attention.
+//   Returns an empty vector if `query_length` is 0.
+// Panics if `chunk_size` is 0.
+pub fn generate_chunked_causal_2d_mask(
+    query_length: usize,
+    key_value_length: usize,
+    chunk_size: usize,
+) -> Vec<Vec<bool>> {
+    if chunk_size == 0 {
+        panic!("chunk_size cannot be zero for chunked causal mask generation.");
+    }
+
+    if query_length == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = Vec::with_capacity(query_length);
+    for q_idx in 0..query_length {
+        let mut row = Vec::with_capacity(key_value_length);
+        let q_chunk = q_idx / chunk_size; // Integer division
+
+        for kv_idx in 0..key_value_length {
+            let kv_chunk = kv_idx / chunk_size; // Integer division
+
+            let is_causal = kv_idx <= q_idx;
+            let is_same_chunk = q_chunk == kv_chunk;
+
+            if is_causal && is_same_chunk {
+                row.push(true);
+            } else {
+                row.push(false);
+            }
+        }
+        mask.push(row);
+    }
+    mask
+}
+
 // Generates a 2D sliding window causal attention mask.
 //
 // A query at position `q_idx` can attend to keys at positions `kv_idx` if:
@@ -456,6 +507,123 @@ mod tests {
     fn test_generate_sliding_window_causal_2d_mask_kv_len_zero() {
         let q_len = 3;
         let mask = generate_sliding_window_causal_2d_mask(q_len, 0, 2);
+        let expected_mask = vec![
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_basic() {
+        let q_len = 6;
+        let kv_len = 6;
+        let chunk_size = 2;
+        let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        // Chunk 0: q_idx=0,1. kv_idx=0,1
+        // Chunk 1: q_idx=2,3. kv_idx=2,3
+        // Chunk 2: q_idx=4,5. kv_idx=4,5
+        //
+        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F,F,F,F,F)
+        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T,F,F,F,F)
+        // q2 (chunk 1): kv_idx <= 2 && kv_chunk == 1 -> (F,F,T,F,F,F) (kv2 is in chunk 1)
+        // q3 (chunk 1): kv_idx <= 3 && kv_chunk == 1 -> (F,F,T,T,F,F) (kv2,kv3 are in chunk 1)
+        // q4 (chunk 2): kv_idx <= 4 && kv_chunk == 2 -> (F,F,F,F,T,F) (kv4 is in chunk 2)
+        // q5 (chunk 2): kv_idx <= 5 && kv_chunk == 2 -> (F,F,F,F,T,T) (kv4,kv5 are in chunk 2)
+        let expected_mask = vec![
+            vec![true, false, false, false, false, false],
+            vec![true, true,  false, false, false, false],
+            vec![false, false, true, false, false, false],
+            vec![false, false, true, true,  false, false],
+            vec![false, false, false, false, true, false],
+            vec![false, false, false, false, true, true],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_chunk_size_1() {
+        // Should behave like normal causal mask if chunk_size is 1
+        let q_len = 3;
+        let kv_len = 3;
+        let chunk_size = 1;
+        let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        // With chunk_size = 1, q_chunk == kv_chunk implies q_idx == kv_idx.
+        // Combined with is_causal (kv_idx <= q_idx), it means only kv_idx == q_idx is true.
+        let expected_mask_chunk_1 = vec![
+            vec![true, false, false],
+            vec![false, true, false],
+            vec![false, false, true],
+        ];
+        assert_eq!(mask, expected_mask_chunk_1);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_large_chunk_size() {
+        // If chunk_size >= query_length, all queries are in chunk 0.
+        // If chunk_size >= key_value_length, all keys are in chunk 0.
+        // So, if chunk_size >= max(q_len, kv_len), it's like normal causal mask.
+        let q_len = 3;
+        let kv_len = 4;
+        let chunk_size = 5;
+        let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        let expected_causal_mask = generate_causal_2d_mask(q_len, kv_len);
+        assert_eq!(mask, expected_causal_mask);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_kv_len_greater() {
+        let q_len = 2;
+        let kv_len = 5;
+        let chunk_size = 2;
+        let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F,F,F,F)
+        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T,F,F,F)
+        let expected_mask = vec![
+            vec![true, false, false, false, false],
+            vec![true, true,  false, false, false],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_q_len_greater() {
+        let q_len = 5;
+        let kv_len = 2;
+        let chunk_size = 2;
+        let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F)
+        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T)
+        // q2 (chunk 1): kv_idx <= 1 && kv_chunk == 1 -> (F,F) (no kv in chunk 1 if kv_len=2)
+        // q3 (chunk 1): kv_idx <= 1 && kv_chunk == 1 -> (F,F)
+        // q4 (chunk 2): kv_idx <= 1 && kv_chunk == 2 -> (F,F)
+        let expected_mask = vec![
+            vec![true, false],
+            vec![true, true],
+            vec![false, false],
+            vec![false, false],
+            vec![false, false],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_size cannot be zero for chunked causal mask generation.")]
+    fn test_generate_chunked_causal_2d_mask_panic_zero_chunk_size() {
+        generate_chunked_causal_2d_mask(3, 3, 0);
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_q_len_zero() {
+        let mask = generate_chunked_causal_2d_mask(0, 5, 2);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn test_generate_chunked_causal_2d_mask_kv_len_zero() {
+        let q_len = 3;
+        let mask = generate_chunked_causal_2d_mask(q_len, 0, 2);
         let expected_mask = vec![
             Vec::<bool>::new(),
             Vec::<bool>::new(),
