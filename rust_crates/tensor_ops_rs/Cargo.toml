@@ -9,7 +9,8 @@ crate-type = ["cdylib"]  # Critical for Python extensions
 
 [dependencies]
 pyo3 = { version = "0.21.0", features = ["extension-module"] }
-regex = "1.10.4" # Or a recent compatible version
+regex = "1.10.4"
+glob = "0.3.1" # Or a recent compatible version
 # Add your preferred Rust tensor library here later, e.g.:
 # ndarray = "0.15"
 # tch = "0.14"
