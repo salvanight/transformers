@@ -82,18 +82,6 @@ pub enum RopeParams {
     Llama3(Llama3RopeScalingParams),
 }
 
-// Module-level helper for comparing f64 vectors with a tolerance
-fn assert_vec_approx_eq(a: &Vec<f64>, b: &Vec<f64>, tolerance: f64) {
-    assert_eq!(a.len(), b.len(), "Vector lengths differ.");
-    for (i, (val_a, val_b)) in a.iter().zip(b.iter()).enumerate() {
-        assert!(
-            (val_a - val_b).abs() < tolerance,
-            "assertion failed at index {}: `(left == right)` (left: `{}`, right: `{}`)",
-            i, val_a, val_b
-        );
-    }
-}
-
 // --- RoPE Computation Functions ---
 
 pub fn compute_default_rope_parameters(base: f64, dim: usize) -> (Vec<f64>, f64) {
@@ -217,7 +205,7 @@ fn find_correction_range(low_rot: f64, high_rot: f64, dim: usize, base: f64, max
     let high_clamped = high.min(max_index_for_ramp).max(low_clamped);
     (low_clamped, high_clamped)
 }
-fn linear_ramp_factor(min_val: f64, mut max_val: f64, dim_ramp: usize) -> Vec<f64> { // Removed mut from min_val
+fn linear_ramp_factor(min_val: f64, mut max_val: f64, dim_ramp: usize) -> Vec<f64> {
     if dim_ramp == 0 { return Vec::new(); }
     if (min_val - max_val).abs() < 1e-9 { max_val += 0.001; }
     let mut ramp_factors = Vec::with_capacity(dim_ramp);
@@ -278,6 +266,131 @@ pub fn compute_rope_parameters(params: &RopeParams) -> (Vec<f64>, f64) {
         RopeParams::Llama3(p_llama3) => compute_llama3_rope_parameters(p_llama3),
     }
 }
+
+// --- RoPE Validation Helper Functions (private) ---
+
+fn validate_default_rope_params(
+    _params: &DefaultRopeScalingParams,
+    _errors: &mut Vec<String>
+) {
+    // No additional validation checks beyond what compute_default_rope_parameters already panics for.
+}
+
+fn validate_linear_rope_params(
+    params: &LinearRopeScalingParams,
+    errors: &mut Vec<String>
+) {
+    if params.factor < 1.0 {
+        errors.push(format!(
+            "Linear RoPE: factor ({}) is < 1.0. While values > 0 are accepted by computation, recommended >= 1.0.",
+            params.factor
+        ));
+    }
+}
+
+fn validate_dynamic_ntk_rope_params(
+    params: &DynamicNtkRopeScalingParams,
+    errors: &mut Vec<String>
+) {
+    if params.factor < 1.0 {
+        errors.push(format!(
+            "Dynamic NTK RoPE: factor ({}) is < 1.0. While values > 0 are accepted by computation, recommended >= 1.0.",
+            params.factor
+        ));
+    }
+}
+
+fn validate_yarn_rope_params(
+    params: &YarnParams,
+    errors: &mut Vec<String>
+) {
+    if params.scaling_factor < 1.0 {
+            errors.push(format!(
+            "YaRN RoPE: scaling_factor ({}) should ideally be >= 1.0.", params.scaling_factor
+        ));
+    }
+    if let Some(attn_factor) = params.yarn_attn_factor_override {
+        if attn_factor <= 0.0 {
+            errors.push(format!(
+                "YaRN RoPE: yarn_attn_factor_override ({}) must be > 0.0.", attn_factor
+            ));
+        }
+    }
+    let beta_fast = params.beta_fast.unwrap_or(32.0);
+    let beta_slow = params.beta_slow.unwrap_or(1.0);
+    if beta_fast <= beta_slow {
+        errors.push(format!(
+            "YaRN RoPE: beta_fast ({}) should ideally be > beta_slow ({}).", beta_fast, beta_slow
+        ));
+    }
+}
+
+fn validate_long_rope_params(
+    params: &LongRopeParams,
+    errors: &mut Vec<String>
+) {
+    let actual_original_max_pos_embeddings = params.config_original_max_pos_embeddings_override
+        .unwrap_or(params.config_max_pos_embeddings);
+
+    let effective_factor = if params.config_original_max_pos_embeddings_override.is_some() {
+        if actual_original_max_pos_embeddings == 0 {
+            errors.push("LongRoPE: actual_original_max_pos_embeddings resolved to 0.".to_string());
+            1.0
+        } else {
+            (params.config_max_pos_embeddings as f64) / (actual_original_max_pos_embeddings as f64)
+        }
+    } else {
+        params.rope_scaling_factor_override.unwrap_or(1.0)
+    };
+
+    if params.config_original_max_pos_embeddings_override.is_none() {
+        if effective_factor < 1.0 {
+                errors.push(format!(
+                "LongRoPE: rope_scaling_factor_override (resulting in effective_factor {}) is < 1.0. Recommended >= 1.0 when config.original_max_position_embeddings is not used.",
+                effective_factor
+            ));
+        }
+    }
+    if let Some(attn_factor_override) = params.rope_scaling_attn_factor_override {
+        if attn_factor_override <= 0.0 {
+                errors.push(format!(
+                "LongRoPE: rope_scaling_attn_factor_override ({}) must be > 0.0.", attn_factor_override
+            ));
+        }
+    }
+}
+
+fn validate_llama3_rope_params(
+    params: &Llama3RopeScalingParams,
+    errors: &mut Vec<String>
+) {
+    if params.factor < 1.0 {
+        errors.push(format!(
+            "Llama3 RoPE: factor ({}) should ideally be >= 1.0.", params.factor
+        ));
+    }
+}
+
+// --- Public RoPE Validation Dispatcher ---
+pub fn validate_rope_params(params: &RopeParams) -> Result<(), Vec<String>> {
+    let mut errors: Vec<String> = Vec::new();
+
+    match params {
+        RopeParams::Default(p) => validate_default_rope_params(p, &mut errors),
+        RopeParams::Linear(p) => validate_linear_rope_params(p, &mut errors),
+        RopeParams::DynamicNtk(p) => validate_dynamic_ntk_rope_params(p, &mut errors),
+        RopeParams::Yarn(p_yarn) => validate_yarn_rope_params(p_yarn, &mut errors),
+        RopeParams::LongRope(p_long) => validate_long_rope_params(p_long, &mut errors),
+        RopeParams::Llama3(p_llama3) => validate_llama3_rope_params(p_llama3, &mut errors),
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
 
 // --- RoPE Application ---
 pub fn apply_rotary_pos_emb(x: &mut Vec<Vec<Vec<f64>>>, inv_freq: &Vec<f64>, position_offset: usize) {
@@ -488,7 +601,6 @@ mod tests {
     fn test_find_correction_dim_panic_base() {
         find_correction_dim(32.0, 128, 1.0, 2048);
     }
-    // Removed test_find_correction_dim_panic_term_inside_log as it tests an unreachable panic.
 
     #[test]
     fn test_find_correction_range_logic() {
