@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub type MaskFunction = Box<dyn Fn(usize, usize, usize, usize) -> bool>;
+
 pub fn prepare_padding_mask(
     attention_mask_opt: Option<Vec<Vec<bool>>>,
     kv_length: usize,
@@ -26,10 +28,6 @@ pub fn prepare_padding_mask(
     let batch_size = attention_mask.len();
 
     if batch_size == 0 {
-        // Return the original empty Vec if batch_size is 0,
-        // or an empty Vec of the correct type if slice_output is true.
-        // The original logic `return Some(attention_mask)` is fine for both cases here
-        // as an empty Vec<Vec<bool>> is the correct representation.
         return Some(attention_mask);
     }
 
@@ -69,7 +67,7 @@ pub fn prepare_padding_mask(
         if slice_end > current_mask_len {
             panic!("Slice end {} is out of bounds for mask length {}", slice_end, current_mask_len);
         }
-        if slice_start > slice_end { // kv_length is 0
+        if slice_start > slice_end {
             for _ in 0..batch_size {
                 result_mask.push(Vec::new());
             }
@@ -80,8 +78,6 @@ pub fn prepare_padding_mask(
             let current_row = &attention_mask[i];
             let sliced_row: Vec<bool> = current_row[slice_start..slice_end].to_vec();
 
-            // This assertion should hold if logic up to here is correct
-            // and Rust's slice behavior is as expected.
             if sliced_row.len() != kv_length {
                 panic!("Sliced row length {} does not match kv_length {}. Slice start {}, end {}.",
                         sliced_row.len(), kv_length, slice_start, slice_end);
@@ -92,21 +88,8 @@ pub fn prepare_padding_mask(
     } else {
         return Some(attention_mask);
     }
-} // Correctly closing prepare_padding_mask function
+}
 
-// Generates a 2D causal attention mask.
-//
-// In a causal mask, a query at position `q_idx` can attend to keys at positions
-// `kv_idx` where `kv_idx <= q_idx`.
-//
-// Args:
-//   query_length: The number of queries (rows in the output mask).
-//   key_value_length: The number of keys/values (columns in the output mask).
-//
-// Returns:
-//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
-//   `true` indicates an allowed attention, `false` indicates a masked attention.
-//   Returns an empty vector if `query_length` is 0.
 pub fn generate_causal_2d_mask(
     query_length: usize,
     key_value_length: usize,
@@ -130,74 +113,6 @@ pub fn generate_causal_2d_mask(
     mask
 }
 
-// Generates a 2D chunked causal attention mask.
-//
-// A query at position `q_idx` can attend to keys at positions `kv_idx` if:
-// 1. `kv_idx <= q_idx` (causal condition)
-// 2. `kv_idx / chunk_size == q_idx / chunk_size` (both indices fall within the same chunk).
-//
-// Args:
-//   query_length: The number of queries (rows in the output mask).
-//   key_value_length: The number of keys/values (columns in the output mask).
-//   chunk_size: The size of each chunk. Must be greater than 0.
-//
-// Returns:
-//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
-//   `true` indicates an allowed attention, `false` indicates a masked attention.
-//   Returns an empty vector if `query_length` is 0.
-// Panics if `chunk_size` is 0.
-pub fn generate_chunked_causal_2d_mask(
-    query_length: usize,
-    key_value_length: usize,
-    chunk_size: usize,
-) -> Vec<Vec<bool>> {
-    if chunk_size == 0 {
-        panic!("chunk_size cannot be zero for chunked causal mask generation.");
-    }
-
-    if query_length == 0 {
-        return Vec::new();
-    }
-
-    let mut mask = Vec::with_capacity(query_length);
-    for q_idx in 0..query_length {
-        let mut row = Vec::with_capacity(key_value_length);
-        let q_chunk = q_idx / chunk_size; // Integer division
-
-        for kv_idx in 0..key_value_length {
-            let kv_chunk = kv_idx / chunk_size; // Integer division
-
-            let is_causal = kv_idx <= q_idx;
-            let is_same_chunk = q_chunk == kv_chunk;
-
-            if is_causal && is_same_chunk {
-                row.push(true);
-            } else {
-                row.push(false);
-            }
-        }
-        mask.push(row);
-    }
-    mask
-}
-
-// Generates a 2D sliding window causal attention mask.
-//
-// A query at position `q_idx` can attend to keys at positions `kv_idx` if:
-// 1. `kv_idx <= q_idx` (causal condition)
-// 2. `kv_idx > q_idx - sliding_window` (sliding window condition)
-//
-// Args:
-//   query_length: The number of queries (rows in the output mask).
-//   key_value_length: The number of keys/values (columns in the output mask).
-//   sliding_window: The size of the sliding window.
-//                   A `sliding_window` of 0 means no token can be attended to (as kv_idx > q_idx and kv_idx <= q_idx is impossible).
-//                   A `sliding_window` >= `query_length` (and >= `key_value_length` for practical purposes related to `q_idx`) behaves like a normal causal mask.
-//
-// Returns:
-//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
-//   `true` indicates an allowed attention, `false` indicates a masked attention.
-//   Returns an empty vector if `query_length` is 0.
 pub fn generate_sliding_window_causal_2d_mask(
     query_length: usize,
     key_value_length: usize,
@@ -217,8 +132,6 @@ pub fn generate_sliding_window_causal_2d_mask(
             let kv_idx_isize = kv_idx as isize;
 
             let is_causal = kv_idx <= q_idx;
-            // Condition: kv_idx > q_idx - sliding_window
-            // This means q_idx - sliding_window < kv_idx
             let is_within_window = (q_idx_isize - sliding_window_isize) < kv_idx_isize;
 
             if is_causal && is_within_window {
@@ -232,22 +145,41 @@ pub fn generate_sliding_window_causal_2d_mask(
     mask
 }
 
-// Converts a 2D boolean attention mask to a 2D float attention mask.
-//
-// This is often used to prepare a mask for addition to attention scores,
-// where 0.0 allows attention and a large negative number effectively masks it.
-//
-// Args:
-//   bool_mask: A 2D vector of booleans representing the input mask.
-//              `true` values are typically positions to attend to.
-//   false_value: The float value to use for positions where `bool_mask` is `false`.
-//                Typically `std::f64::NEG_INFINITY` or a large negative number.
-//
-// Returns:
-//   A 2D vector `Vec<Vec<f64>>` of the same dimensions as `bool_mask`,
-//   where `true` values from `bool_mask` are converted to `0.0` and
-//   `false` values are converted to `false_value`.
-//   Returns an empty vector if `bool_mask` is empty (i.e., batch size is 0).
+pub fn generate_chunked_causal_2d_mask(
+    query_length: usize,
+    key_value_length: usize,
+    chunk_size: usize,
+) -> Vec<Vec<bool>> {
+    if chunk_size == 0 {
+        panic!("chunk_size cannot be zero for chunked causal mask generation.");
+    }
+
+    if query_length == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = Vec::with_capacity(query_length);
+    for q_idx in 0..query_length {
+        let mut row = Vec::with_capacity(key_value_length);
+        let q_chunk = q_idx / chunk_size;
+
+        for kv_idx in 0..key_value_length {
+            let kv_chunk = kv_idx / chunk_size;
+
+            let is_causal = kv_idx <= q_idx;
+            let is_same_chunk = q_chunk == kv_chunk;
+
+            if is_causal && is_same_chunk {
+                row.push(true);
+            } else {
+                row.push(false);
+            }
+        }
+        mask.push(row);
+    }
+    mask
+}
+
 pub fn convert_boolean_mask_to_float(
     bool_mask: &Vec<Vec<bool>>,
     false_value: f64,
@@ -260,7 +192,7 @@ pub fn convert_boolean_mask_to_float(
 
     for row_bool in bool_mask.iter() {
         let mut row_float = Vec::with_capacity(row_bool.len());
-        for &val_bool in row_bool.iter() { // Use &val_bool to get value directly
+        for &val_bool in row_bool.iter() {
             if val_bool {
                 row_float.push(0.0);
             } else {
@@ -271,6 +203,85 @@ pub fn convert_boolean_mask_to_float(
     }
     float_mask
 }
+
+// --- Mask Composition and Utility Functions ---
+
+pub fn and_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
+    Box::new(move |batch_idx, head_idx, q_idx, kv_idx| {
+        if mask_functions.is_empty() {
+            return true; // Identity for AND
+        }
+        for func in &mask_functions {
+            if !func(batch_idx, head_idx, q_idx, kv_idx) {
+                return false; // Short-circuit
+            }
+        }
+        true
+    })
+}
+
+pub fn or_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
+    Box::new(move |batch_idx, head_idx, q_idx, kv_idx| {
+        if mask_functions.is_empty() {
+            return false; // Identity for OR
+        }
+        for func in &mask_functions {
+            if func(batch_idx, head_idx, q_idx, kv_idx) {
+                return true; // Short-circuit
+            }
+        }
+        false
+    })
+}
+
+pub fn generate_mask_from_logic(
+    query_length: usize,
+    key_value_length: usize,
+    logic: &MaskFunction,
+) -> Vec<Vec<bool>> {
+    if query_length == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = Vec::with_capacity(query_length);
+    for q_idx in 0..query_length {
+        let mut row = Vec::with_capacity(key_value_length);
+        for kv_idx in 0..key_value_length {
+            if logic(0, 0, q_idx, kv_idx) { // Pass 0 for batch_idx, head_idx
+                row.push(true);
+            } else {
+                row.push(false);
+            }
+        }
+        mask.push(row);
+    }
+    mask
+}
+
+// --- Primitive Mask Logic Functions (private helpers) ---
+
+fn causal_logic(_batch_idx: usize, _head_idx: usize, q_idx: usize, kv_idx: usize) -> bool {
+    kv_idx <= q_idx
+}
+
+fn sliding_window_logic_fn(window_size: usize) -> MaskFunction {
+    Box::new(move |_batch_idx: usize, _head_idx: usize, q_idx: usize, kv_idx: usize| {
+        let q_idx_isize = q_idx as isize;
+        let kv_idx_isize = kv_idx as isize;
+        let window_size_isize = window_size as isize;
+        (q_idx_isize - window_size_isize) < kv_idx_isize
+    })
+}
+
+fn chunked_logic_fn(chunk_size: usize) -> MaskFunction {
+    if chunk_size == 0 {
+        panic!("chunk_size cannot be zero for chunked_logic_fn.");
+    }
+    Box::new(move |_batch_idx: usize, _head_idx: usize, q_idx: usize, kv_idx: usize| {
+        (q_idx / chunk_size) == (kv_idx / chunk_size)
+    })
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -285,10 +296,10 @@ mod tests {
     fn test_empty_batch_returns_empty() {
         let mask: Vec<Vec<bool>> = Vec::new();
         let result = prepare_padding_mask(Some(mask.clone()), 5, 0, false);
-        assert_eq!(result, Some(mask)); // Expecting Some(Vec::new())
+        assert_eq!(result, Some(mask));
 
         let result_slice = prepare_padding_mask(Some(Vec::new()), 5, 0, true);
-        assert_eq!(result_slice, Some(Vec::new())); // Expecting Some(Vec::new())
+        assert_eq!(result_slice, Some(Vec::new()));
     }
 
     #[test]
@@ -366,25 +377,16 @@ mod tests {
         prepare_padding_mask(Some(mask), usize::MAX, 1, false);
     }
 
-    // The following tests were commented out as they test unreachable panic conditions
-    // based on the current logic of prepare_padding_mask.
-    // #[test]
-    // #[should_panic(expected = "Slice end 3 is out of bounds for mask length 2")]
-    // fn test_panic_slice_end_out_of_bounds() { ... }
-
-    // #[test]
-    // #[should_panic(expected = "Sliced row length 1 does not match kv_length 2")]
-    // fn test_panic_slice_len_mismatch() { ... }
-
+    // --- Tests for generate_causal_2d_mask ---
     #[test]
     fn test_generate_causal_2d_mask_square() {
         let q_len = 3;
         let kv_len = 3;
         let mask = generate_causal_2d_mask(q_len, kv_len);
         let expected_mask = vec![
-            vec![true, false, false], // q0 can attend to kv0
-            vec![true, true, false],  // q1 can attend to kv0, kv1
-            vec![true, true, true],   // q2 can attend to kv0, kv1, kv2
+            vec![true, false, false],
+            vec![true, true, false],
+            vec![true, true, true],
         ];
         assert_eq!(mask, expected_mask);
     }
@@ -395,8 +397,8 @@ mod tests {
         let kv_len = 4;
         let mask = generate_causal_2d_mask(q_len, kv_len);
         let expected_mask = vec![
-            vec![true, false, false, false], // q0 can attend to kv0
-            vec![true, true, false, false],  // q1 can attend to kv0, kv1
+            vec![true, false, false, false],
+            vec![true, true, false, false],
         ];
         assert_eq!(mask, expected_mask);
     }
@@ -407,10 +409,10 @@ mod tests {
         let kv_len = 2;
         let mask = generate_causal_2d_mask(q_len, kv_len);
         let expected_mask = vec![
-            vec![true, false],       // q0 can attend to kv0
-            vec![true, true],        // q1 can attend to kv0, kv1
-            vec![true, true],        // q2 can attend to kv0, kv1 (kv_len is limit)
-            vec![true, true],        // q3 can attend to kv0, kv1 (kv_len is limit)
+            vec![true, false],
+            vec![true, true],
+            vec![true, true],
+            vec![true, true],
         ];
         assert_eq!(mask, expected_mask);
     }
@@ -425,11 +427,7 @@ mod tests {
     fn test_generate_causal_2d_mask_kv_len_zero() {
         let q_len = 3;
         let mask = generate_causal_2d_mask(q_len, 0);
-        let expected_mask = vec![
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-        ];
+        let expected_mask = vec![ Vec::<bool>::new(), Vec::<bool>::new(), Vec::<bool>::new()];
         assert_eq!(mask, expected_mask);
     }
 
@@ -439,31 +437,27 @@ mod tests {
         assert!(mask.is_empty());
     }
 
+    // --- Tests for generate_sliding_window_causal_2d_mask ---
     #[test]
     fn test_generate_sliding_window_causal_2d_mask_basic() {
         let q_len = 4;
         let kv_len = 4;
         let window = 2;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        // q0: kv_idx <= 0 && kv_idx > 0-2 (-2) -> kv0 (T)
-        // q1: kv_idx <= 1 && kv_idx > 1-2 (-1) -> kv0, kv1 (T,T)
-        // q2: kv_idx <= 2 && kv_idx > 2-2 (0)  -> kv1, kv2 (F,T,T) (kv0 is F because 0 is not > 0)
-        // q3: kv_idx <= 3 && kv_idx > 3-2 (1)  -> kv2, kv3 (F,F,T,T) (kv0,1 are F because not > 1)
         let expected_mask = vec![
-            vec![true, false, false, false], // q0 attends to kv0
-            vec![true, true, false, false],  // q1 attends to kv0, kv1
-            vec![false, true, true, false],  // q2 attends to kv1, kv2
-            vec![false, false, true, true],  // q3 attends to kv2, kv3
+            vec![true, false, false, false],
+            vec![true, true, false, false],
+            vec![false, true, true, false],
+            vec![false, false, true, true],
         ];
         assert_eq!(mask, expected_mask);
     }
 
     #[test]
     fn test_generate_sliding_window_causal_2d_mask_large_window() {
-        // Should behave like normal causal mask
         let q_len = 3;
         let kv_len = 3;
-        let window = 5; // window >= q_len
+        let window = 5;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
         let expected_causal_mask = generate_causal_2d_mask(q_len, kv_len);
         assert_eq!(mask, expected_causal_mask);
@@ -475,12 +469,7 @@ mod tests {
         let kv_len = 3;
         let window = 0;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        // kv_idx <= q_idx && kv_idx > q_idx. Impossible. All false.
-        let expected_mask = vec![
-            vec![false, false, false],
-            vec![false, false, false],
-            vec![false, false, false],
-        ];
+        let expected_mask = vec![ vec![false, false, false], vec![false, false, false], vec![false, false, false]];
         assert_eq!(mask, expected_mask);
     }
 
@@ -490,10 +479,6 @@ mod tests {
         let kv_len = 4;
         let window = 1;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        // q0: kv_idx <= 0 && kv_idx > 0-1 (-1) -> kv0 (T)
-        // q1: kv_idx <= 1 && kv_idx > 1-1 (0)  -> kv1 (F,T) (kv0 is F because 0 not > 0)
-        // q2: kv_idx <= 2 && kv_idx > 2-1 (1)  -> kv2 (F,F,T) (kv0,1 are F because not > 1)
-        // q3: kv_idx <= 3 && kv_idx > 3-1 (2)  -> kv3 (F,F,F,T) (kv0,1,2 are F because not > 2)
         let expected_mask = vec![
             vec![true, false, false, false],
             vec![false, true, false, false],
@@ -509,12 +494,7 @@ mod tests {
         let kv_len = 4;
         let window = 1;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        // q0: kv_idx <= 0 && kv_idx > -1 -> kv0 (T,F,F,F)
-        // q1: kv_idx <= 1 && kv_idx > 0  -> kv1 (F,T,F,F)
-        let expected_mask = vec![
-            vec![true, false, false, false],
-            vec![false, true, false, false],
-        ];
+        let expected_mask = vec![ vec![true, false, false, false], vec![false, true, false, false]];
         assert_eq!(mask, expected_mask);
     }
 
@@ -524,16 +504,7 @@ mod tests {
         let kv_len = 2;
         let window = 1;
         let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        // q0: kv_idx <= 0 && kv_idx > -1 -> kv0 (T,F)
-        // q1: kv_idx <= 1 && kv_idx > 0  -> kv1 (F,T)
-        // q2: kv_idx <= 1 && kv_idx > 1  -> (F,F) (kv_idx for kv0=0, kv1=1. No kv_idx > 1 is <=1)
-        // q3: kv_idx <= 1 && kv_idx > 2  -> (F,F) (No kv_idx > 2 is <=1)
-        let expected_mask = vec![
-            vec![true, false],
-            vec![false, true],
-            vec![false, false], // Corrected based on strict kv_idx > q_idx - window
-            vec![false, false], // Corrected
-        ];
+        let expected_mask = vec![ vec![true, false], vec![false, true], vec![false, false], vec![false, false]];
         assert_eq!(mask, expected_mask);
     }
 
@@ -547,30 +518,17 @@ mod tests {
     fn test_generate_sliding_window_causal_2d_mask_kv_len_zero() {
         let q_len = 3;
         let mask = generate_sliding_window_causal_2d_mask(q_len, 0, 2);
-        let expected_mask = vec![
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-        ];
+        let expected_mask = vec![ Vec::<bool>::new(), Vec::<bool>::new(), Vec::<bool>::new()];
         assert_eq!(mask, expected_mask);
     }
 
+    // --- Tests for generate_chunked_causal_2d_mask ---
     #[test]
     fn test_generate_chunked_causal_2d_mask_basic() {
         let q_len = 6;
         let kv_len = 6;
         let chunk_size = 2;
         let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
-        // Chunk 0: q_idx=0,1. kv_idx=0,1
-        // Chunk 1: q_idx=2,3. kv_idx=2,3
-        // Chunk 2: q_idx=4,5. kv_idx=4,5
-        //
-        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F,F,F,F,F)
-        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T,F,F,F,F)
-        // q2 (chunk 1): kv_idx <= 2 && kv_chunk == 1 -> (F,F,T,F,F,F) (kv2 is in chunk 1)
-        // q3 (chunk 1): kv_idx <= 3 && kv_chunk == 1 -> (F,F,T,T,F,F) (kv2,kv3 are in chunk 1)
-        // q4 (chunk 2): kv_idx <= 4 && kv_chunk == 2 -> (F,F,F,F,T,F) (kv4 is in chunk 2)
-        // q5 (chunk 2): kv_idx <= 5 && kv_chunk == 2 -> (F,F,F,F,T,T) (kv4,kv5 are in chunk 2)
         let expected_mask = vec![
             vec![true, false, false, false, false, false],
             vec![true, true,  false, false, false, false],
@@ -584,13 +542,10 @@ mod tests {
 
     #[test]
     fn test_generate_chunked_causal_2d_mask_chunk_size_1() {
-        // Should behave like normal causal mask if chunk_size is 1
         let q_len = 3;
         let kv_len = 3;
         let chunk_size = 1;
         let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
-        // With chunk_size = 1, q_chunk == kv_chunk implies q_idx == kv_idx.
-        // Combined with is_causal (kv_idx <= q_idx), it means only kv_idx == q_idx is true.
         let expected_mask_chunk_1 = vec![
             vec![true, false, false],
             vec![false, true, false],
@@ -601,9 +556,6 @@ mod tests {
 
     #[test]
     fn test_generate_chunked_causal_2d_mask_large_chunk_size() {
-        // If chunk_size >= query_length, all queries are in chunk 0.
-        // If chunk_size >= key_value_length, all keys are in chunk 0.
-        // So, if chunk_size >= max(q_len, kv_len), it's like normal causal mask.
         let q_len = 3;
         let kv_len = 4;
         let chunk_size = 5;
@@ -618,8 +570,6 @@ mod tests {
         let kv_len = 5;
         let chunk_size = 2;
         let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
-        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F,F,F,F)
-        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T,F,F,F)
         let expected_mask = vec![
             vec![true, false, false, false, false],
             vec![true, true,  false, false, false],
@@ -633,17 +583,8 @@ mod tests {
         let kv_len = 2;
         let chunk_size = 2;
         let mask = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
-        // q0 (chunk 0): kv_idx <= 0 && kv_chunk == 0 -> kv0 (T,F)
-        // q1 (chunk 0): kv_idx <= 1 && kv_chunk == 0 -> kv0,kv1 (T,T)
-        // q2 (chunk 1): kv_idx <= 1 && kv_chunk == 1 -> (F,F) (no kv in chunk 1 if kv_len=2)
-        // q3 (chunk 1): kv_idx <= 1 && kv_chunk == 1 -> (F,F)
-        // q4 (chunk 2): kv_idx <= 1 && kv_chunk == 2 -> (F,F)
         let expected_mask = vec![
-            vec![true, false],
-            vec![true, true],
-            vec![false, false],
-            vec![false, false],
-            vec![false, false],
+            vec![true, false], vec![true, true], vec![false, false], vec![false, false], vec![false, false],
         ];
         assert_eq!(mask, expected_mask);
     }
@@ -664,26 +605,17 @@ mod tests {
     fn test_generate_chunked_causal_2d_mask_kv_len_zero() {
         let q_len = 3;
         let mask = generate_chunked_causal_2d_mask(q_len, 0, 2);
-        let expected_mask = vec![
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-            Vec::<bool>::new(),
-        ];
+        let expected_mask = vec![ Vec::<bool>::new(), Vec::<bool>::new(), Vec::<bool>::new()];
         assert_eq!(mask, expected_mask);
     }
 
+    // --- Tests for convert_boolean_mask_to_float ---
     #[test]
     fn test_convert_boolean_mask_to_float_basic() {
-        let bool_mask = vec![
-            vec![true, false, true],
-            vec![false, true, true],
-        ];
+        let bool_mask = vec![ vec![true, false, true], vec![false, true, true]];
         let false_val = -10000.0;
         let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
-        let expected_float_mask = vec![
-            vec![0.0, false_val, 0.0],
-            vec![false_val, 0.0, 0.0],
-        ];
+        let expected_float_mask = vec![ vec![0.0, false_val, 0.0], vec![false_val, 0.0, 0.0]];
         assert_eq!(float_mask, expected_float_mask);
     }
 
@@ -729,6 +661,159 @@ mod tests {
         let float_mask = convert_boolean_mask_to_float(&bool_mask, false_val);
         let expected_float_mask = vec![vec![false_val, false_val], vec![false_val, false_val]];
         assert_eq!(float_mask, expected_float_mask);
+    }
+
+    // --- Tests for Mask Composition and Logic Utilities ---
+
+    #[test]
+    fn test_causal_logic() {
+        assert_eq!(causal_logic(0,0,0,0), true);
+        assert_eq!(causal_logic(0,0,0,1), false);
+        assert_eq!(causal_logic(0,0,1,0), true);
+        assert_eq!(causal_logic(0,0,1,1), true);
+        assert_eq!(causal_logic(0,0,1,2), false);
+    }
+
+    #[test]
+    fn test_sliding_window_logic_fn_behavior() {
+        let window_2_logic = sliding_window_logic_fn(2);
+        // q=0: kv > 0-2=-2. kv=0 -> T
+        assert_eq!(window_2_logic(0,0,0,0), true);
+        // q=1: kv > 1-2=-1. kv=0 -> T, kv=1 -> T
+        assert_eq!(window_2_logic(0,0,1,0), true);
+        assert_eq!(window_2_logic(0,0,1,1), true);
+        // q=2: kv > 2-2=0. kv=0 -> F, kv=1 -> T, kv=2 -> T
+        assert_eq!(window_2_logic(0,0,2,0), false);
+        assert_eq!(window_2_logic(0,0,2,1), true);
+        assert_eq!(window_2_logic(0,0,2,2), true);
+    }
+
+    #[test]
+    fn test_chunked_logic_fn_behavior() {
+        let chunk_2_logic = chunked_logic_fn(2);
+        // q=0,c=0: kv=0,c=0 (T); kv=1,c=0 (T); kv=2,c=1 (F)
+        assert_eq!(chunk_2_logic(0,0,0,0), true);
+        assert_eq!(chunk_2_logic(0,0,0,1), true);
+        assert_eq!(chunk_2_logic(0,0,0,2), false);
+        // q=1,c=0: kv=0,c=0 (T); kv=1,c=0 (T); kv=2,c=1 (F)
+        assert_eq!(chunk_2_logic(0,0,1,0), true);
+        assert_eq!(chunk_2_logic(0,0,1,1), true);
+        assert_eq!(chunk_2_logic(0,0,1,2), false);
+        // q=2,c=1: kv=0,c=0 (F); kv=1,c=0 (F); kv=2,c=1 (T); kv=3,c=1 (T)
+        assert_eq!(chunk_2_logic(0,0,2,1), false);
+        assert_eq!(chunk_2_logic(0,0,2,2), true);
+        assert_eq!(chunk_2_logic(0,0,2,3), true);
+    }
+
+    #[test]
+    #[should_panic(expected = "chunk_size cannot be zero for chunked_logic_fn.")]
+    fn test_chunked_logic_fn_panic_zero_chunk() {
+        let _ = chunked_logic_fn(0);
+        // The panic occurs when the Box is created, not when the closure is called.
+        // To test the panic, we just need to create it.
+    }
+
+    #[test]
+    fn test_and_masks_rust_logic() {
+        // Create new instances instead of cloning for simple test closures
+        let combined_tt = and_masks_rust(vec![
+            Box::new(|_,_,_,_| true),
+            Box::new(|_,_,_,_| true)
+        ]);
+        assert_eq!(combined_tt(0,0,0,0), true);
+
+        let combined_tf = and_masks_rust(vec![
+            Box::new(|_,_,_,_| true),
+            Box::new(|_,_,_,_| false)
+        ]);
+        assert_eq!(combined_tf(0,0,0,0), false);
+
+        let combined_ft = and_masks_rust(vec![
+            Box::new(|_,_,_,_| false),
+            Box::new(|_,_,_,_| true)
+        ]);
+        assert_eq!(combined_ft(0,0,0,0), false);
+
+        let combined_ff = and_masks_rust(vec![
+            Box::new(|_,_,_,_| false),
+            Box::new(|_,_,_,_| false)
+        ]);
+        assert_eq!(combined_ff(0,0,0,0), false);
+
+        let empty_and = and_masks_rust(vec![]);
+        assert_eq!(empty_and(0,0,0,0), true); // Identity for AND is true
+    }
+
+    #[test]
+    fn test_or_masks_rust_logic() {
+        // Create new instances instead of cloning
+        let combined_tt = or_masks_rust(vec![
+            Box::new(|_,_,_,_| true),
+            Box::new(|_,_,_,_| true)
+        ]);
+        assert_eq!(combined_tt(0,0,0,0), true);
+
+        let combined_tf = or_masks_rust(vec![
+            Box::new(|_,_,_,_| true),
+            Box::new(|_,_,_,_| false)
+        ]);
+        assert_eq!(combined_tf(0,0,0,0), true);
+
+        let combined_ft = or_masks_rust(vec![
+            Box::new(|_,_,_,_| false),
+            Box::new(|_,_,_,_| true)
+        ]);
+        assert_eq!(combined_ft(0,0,0,0), true);
+
+        let combined_ff = or_masks_rust(vec![
+            Box::new(|_,_,_,_| false),
+            Box::new(|_,_,_,_| false)
+        ]);
+        assert_eq!(combined_ff(0,0,0,0), false);
+
+        let empty_or = or_masks_rust(vec![]);
+        assert_eq!(empty_or(0,0,0,0), false); // Identity for OR is false
+    }
+
+    #[test]
+    fn test_generate_mask_from_logic_causal() {
+        let q_len = 3;
+        let kv_len = 3;
+        let causal_mask_fn: MaskFunction = Box::new(causal_logic);
+        let generated = generate_mask_from_logic(q_len, kv_len, &causal_mask_fn);
+        let expected = generate_causal_2d_mask(q_len, kv_len);
+        assert_eq!(generated, expected);
+    }
+
+    #[test]
+    fn test_generate_mask_from_logic_combined() {
+        let q_len = 4;
+        let kv_len = 4;
+        let chunk_size = 2;
+
+        // Equivalent to: is_causal AND is_same_chunk
+        let combined_logic = and_masks_rust(vec![
+            Box::new(causal_logic),
+            chunked_logic_fn(chunk_size),
+        ]);
+        let generated = generate_mask_from_logic(q_len, kv_len, &combined_logic);
+        let expected = generate_chunked_causal_2d_mask(q_len, kv_len, chunk_size);
+        assert_eq!(generated, expected);
+    }
+
+    #[test]
+    fn test_generate_mask_from_logic_sliding_window_causal() {
+        let q_len = 4;
+        let kv_len = 4;
+        let window = 2;
+
+        let combined_logic = and_masks_rust(vec![
+            Box::new(causal_logic),
+            sliding_window_logic_fn(window)
+        ]);
+        let generated = generate_mask_from_logic(q_len, kv_len, &combined_logic);
+        let expected = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        assert_eq!(generated, expected);
     }
 }
 // This is the very end of the file. No more characters or lines after this.
