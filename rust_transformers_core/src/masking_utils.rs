@@ -94,6 +94,42 @@ pub fn prepare_padding_mask(
     }
 } // Correctly closing prepare_padding_mask function
 
+// Generates a 2D causal attention mask.
+//
+// In a causal mask, a query at position `q_idx` can attend to keys at positions
+// `kv_idx` where `kv_idx <= q_idx`.
+//
+// Args:
+//   query_length: The number of queries (rows in the output mask).
+//   key_value_length: The number of keys/values (columns in the output mask).
+//
+// Returns:
+//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
+//   `true` indicates an allowed attention, `false` indicates a masked attention.
+//   Returns an empty vector if `query_length` is 0.
+pub fn generate_causal_2d_mask(
+    query_length: usize,
+    key_value_length: usize,
+) -> Vec<Vec<bool>> {
+    if query_length == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = Vec::with_capacity(query_length);
+    for q_idx in 0..query_length {
+        let mut row = Vec::with_capacity(key_value_length);
+        for kv_idx in 0..key_value_length {
+            if kv_idx <= q_idx {
+                row.push(true);
+            } else {
+                row.push(false);
+            }
+        }
+        mask.push(row);
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -197,5 +233,68 @@ mod tests {
     // #[test]
     // #[should_panic(expected = "Sliced row length 1 does not match kv_length 2")]
     // fn test_panic_slice_len_mismatch() { ... }
+
+    #[test]
+    fn test_generate_causal_2d_mask_square() {
+        let q_len = 3;
+        let kv_len = 3;
+        let mask = generate_causal_2d_mask(q_len, kv_len);
+        let expected_mask = vec![
+            vec![true, false, false], // q0 can attend to kv0
+            vec![true, true, false],  // q1 can attend to kv0, kv1
+            vec![true, true, true],   // q2 can attend to kv0, kv1, kv2
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_causal_2d_mask_kv_len_greater() {
+        let q_len = 2;
+        let kv_len = 4;
+        let mask = generate_causal_2d_mask(q_len, kv_len);
+        let expected_mask = vec![
+            vec![true, false, false, false], // q0 can attend to kv0
+            vec![true, true, false, false],  // q1 can attend to kv0, kv1
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_causal_2d_mask_q_len_greater() {
+        let q_len = 4;
+        let kv_len = 2;
+        let mask = generate_causal_2d_mask(q_len, kv_len);
+        let expected_mask = vec![
+            vec![true, false],       // q0 can attend to kv0
+            vec![true, true],        // q1 can attend to kv0, kv1
+            vec![true, true],        // q2 can attend to kv0, kv1 (kv_len is limit)
+            vec![true, true],        // q3 can attend to kv0, kv1 (kv_len is limit)
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_causal_2d_mask_q_len_zero() {
+        let mask = generate_causal_2d_mask(0, 5);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn test_generate_causal_2d_mask_kv_len_zero() {
+        let q_len = 3;
+        let mask = generate_causal_2d_mask(q_len, 0);
+        let expected_mask = vec![
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_causal_2d_mask_both_zero() {
+        let mask = generate_causal_2d_mask(0, 0);
+        assert!(mask.is_empty());
+    }
 }
 // This is the very end of the file. No more characters or lines after this.
