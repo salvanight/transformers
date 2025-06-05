@@ -130,6 +130,57 @@ pub fn generate_causal_2d_mask(
     mask
 }
 
+// Generates a 2D sliding window causal attention mask.
+//
+// A query at position `q_idx` can attend to keys at positions `kv_idx` if:
+// 1. `kv_idx <= q_idx` (causal condition)
+// 2. `kv_idx > q_idx - sliding_window` (sliding window condition)
+//
+// Args:
+//   query_length: The number of queries (rows in the output mask).
+//   key_value_length: The number of keys/values (columns in the output mask).
+//   sliding_window: The size of the sliding window.
+//                   A `sliding_window` of 0 means no token can be attended to (as kv_idx > q_idx and kv_idx <= q_idx is impossible).
+//                   A `sliding_window` >= `query_length` (and >= `key_value_length` for practical purposes related to `q_idx`) behaves like a normal causal mask.
+//
+// Returns:
+//   A 2D vector `Vec<Vec<bool>>` of shape `[query_length, key_value_length]`.
+//   `true` indicates an allowed attention, `false` indicates a masked attention.
+//   Returns an empty vector if `query_length` is 0.
+pub fn generate_sliding_window_causal_2d_mask(
+    query_length: usize,
+    key_value_length: usize,
+    sliding_window: usize,
+) -> Vec<Vec<bool>> {
+    if query_length == 0 {
+        return Vec::new();
+    }
+
+    let mut mask = Vec::with_capacity(query_length);
+    let sliding_window_isize = sliding_window as isize;
+
+    for q_idx in 0..query_length {
+        let mut row = Vec::with_capacity(key_value_length);
+        let q_idx_isize = q_idx as isize;
+        for kv_idx in 0..key_value_length {
+            let kv_idx_isize = kv_idx as isize;
+
+            let is_causal = kv_idx <= q_idx;
+            // Condition: kv_idx > q_idx - sliding_window
+            // This means q_idx - sliding_window < kv_idx
+            let is_within_window = (q_idx_isize - sliding_window_isize) < kv_idx_isize;
+
+            if is_causal && is_within_window {
+                row.push(true);
+            } else {
+                row.push(false);
+            }
+        }
+        mask.push(row);
+    }
+    mask
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -295,6 +346,122 @@ mod tests {
     fn test_generate_causal_2d_mask_both_zero() {
         let mask = generate_causal_2d_mask(0, 0);
         assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_basic() {
+        let q_len = 4;
+        let kv_len = 4;
+        let window = 2;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        // q0: kv_idx <= 0 && kv_idx > 0-2 (-2) -> kv0 (T)
+        // q1: kv_idx <= 1 && kv_idx > 1-2 (-1) -> kv0, kv1 (T,T)
+        // q2: kv_idx <= 2 && kv_idx > 2-2 (0)  -> kv1, kv2 (F,T,T) (kv0 is F because 0 is not > 0)
+        // q3: kv_idx <= 3 && kv_idx > 3-2 (1)  -> kv2, kv3 (F,F,T,T) (kv0,1 are F because not > 1)
+        let expected_mask = vec![
+            vec![true, false, false, false], // q0 attends to kv0
+            vec![true, true, false, false],  // q1 attends to kv0, kv1
+            vec![false, true, true, false],  // q2 attends to kv1, kv2
+            vec![false, false, true, true],  // q3 attends to kv2, kv3
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_large_window() {
+        // Should behave like normal causal mask
+        let q_len = 3;
+        let kv_len = 3;
+        let window = 5; // window >= q_len
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        let expected_causal_mask = generate_causal_2d_mask(q_len, kv_len);
+        assert_eq!(mask, expected_causal_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_zero_window() {
+        let q_len = 3;
+        let kv_len = 3;
+        let window = 0;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        // kv_idx <= q_idx && kv_idx > q_idx. Impossible. All false.
+        let expected_mask = vec![
+            vec![false, false, false],
+            vec![false, false, false],
+            vec![false, false, false],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_window_one() {
+        let q_len = 4;
+        let kv_len = 4;
+        let window = 1;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        // q0: kv_idx <= 0 && kv_idx > 0-1 (-1) -> kv0 (T)
+        // q1: kv_idx <= 1 && kv_idx > 1-1 (0)  -> kv1 (F,T) (kv0 is F because 0 not > 0)
+        // q2: kv_idx <= 2 && kv_idx > 2-1 (1)  -> kv2 (F,F,T) (kv0,1 are F because not > 1)
+        // q3: kv_idx <= 3 && kv_idx > 3-1 (2)  -> kv3 (F,F,F,T) (kv0,1,2 are F because not > 2)
+        let expected_mask = vec![
+            vec![true, false, false, false],
+            vec![false, true, false, false],
+            vec![false, false, true, false],
+            vec![false, false, false, true],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_kv_len_greater() {
+        let q_len = 2;
+        let kv_len = 4;
+        let window = 1;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        // q0: kv_idx <= 0 && kv_idx > -1 -> kv0 (T,F,F,F)
+        // q1: kv_idx <= 1 && kv_idx > 0  -> kv1 (F,T,F,F)
+        let expected_mask = vec![
+            vec![true, false, false, false],
+            vec![false, true, false, false],
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_q_len_greater() {
+        let q_len = 4;
+        let kv_len = 2;
+        let window = 1;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
+        // q0: kv_idx <= 0 && kv_idx > -1 -> kv0 (T,F)
+        // q1: kv_idx <= 1 && kv_idx > 0  -> kv1 (F,T)
+        // q2: kv_idx <= 1 && kv_idx > 1  -> (F,F) (kv_idx for kv0=0, kv1=1. No kv_idx > 1 is <=1)
+        // q3: kv_idx <= 1 && kv_idx > 2  -> (F,F) (No kv_idx > 2 is <=1)
+        let expected_mask = vec![
+            vec![true, false],
+            vec![false, true],
+            vec![false, false], // Corrected based on strict kv_idx > q_idx - window
+            vec![false, false], // Corrected
+        ];
+        assert_eq!(mask, expected_mask);
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_q_len_zero() {
+        let mask = generate_sliding_window_causal_2d_mask(0, 5, 2);
+        assert!(mask.is_empty());
+    }
+
+    #[test]
+    fn test_generate_sliding_window_causal_2d_mask_kv_len_zero() {
+        let q_len = 3;
+        let mask = generate_sliding_window_causal_2d_mask(q_len, 0, 2);
+        let expected_mask = vec![
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+            Vec::<bool>::new(),
+        ];
+        assert_eq!(mask, expected_mask);
     }
 }
 // This is the very end of the file. No more characters or lines after this.
