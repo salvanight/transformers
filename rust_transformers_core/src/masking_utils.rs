@@ -12,9 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc; // Added Arc
+use std::sync::Arc;
 
 pub type MaskFunction = Box<dyn Fn(usize, usize, usize, usize) -> bool>;
+
+/// Provides basic information about the state of a Key-Value cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheInfo {
+    /// The number of token positions already processed and present in the KV cache.
+    pub num_seen_tokens: usize,
+}
+
+impl CacheInfo {
+    /// Creates a new `CacheInfo`.
+    pub fn new(num_seen_tokens: usize) -> Self {
+        CacheInfo { num_seen_tokens }
+    }
+
+    /// Returns the number of tokens seen so far (i.e., present in the cache).
+    pub fn get_num_seen_tokens(&self) -> usize {
+        self.num_seen_tokens
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AttentionMaskConfig {
+    pub query_length: usize,
+    pub key_value_length: usize,
+    pub is_causal: bool,
+    pub sliding_window: Option<usize>,
+    pub chunk_size: Option<usize>,
+    pub padding_mask: Option<Arc<Vec<Vec<bool>>>>,
+    pub q_offset: usize,
+    pub kv_offset: usize,
+}
+
+impl AttentionMaskConfig {
+    pub fn new(query_length: usize, key_value_length: usize) -> Self {
+        AttentionMaskConfig {
+            query_length,
+            key_value_length,
+            is_causal: true,
+            sliding_window: None,
+            chunk_size: None,
+            padding_mask: None,
+            q_offset: 0,
+            kv_offset: 0,
+        }
+    }
+}
 
 pub fn prepare_padding_mask(
     attention_mask_opt: Option<Vec<Vec<bool>>>,
@@ -124,7 +170,6 @@ pub fn generate_sliding_window_causal_2d_mask(
         return Vec::new();
     }
 
-    // Refactored implementation:
     let causal_fn: MaskFunction = Box::new(causal_logic);
     let window_fn: MaskFunction = sliding_window_logic_fn(sliding_window);
 
@@ -138,13 +183,12 @@ pub fn generate_chunked_causal_2d_mask(
     key_value_length: usize,
     chunk_size: usize,
 ) -> Vec<Vec<bool>> {
-    // chunk_size == 0 will be caught by chunked_logic_fn
     if query_length == 0 {
         return Vec::new();
     }
 
     let causal_fn: MaskFunction = Box::new(causal_logic);
-    let chunk_fn: MaskFunction = chunked_logic_fn(chunk_size); // Panics if chunk_size is 0
+    let chunk_fn: MaskFunction = chunked_logic_fn(chunk_size);
 
     let combined_logic = and_masks_rust(vec![causal_fn, chunk_fn]);
 
@@ -175,34 +219,91 @@ pub fn convert_boolean_mask_to_float(
     float_mask
 }
 
+/// Determines the appropriate query length, key/value length, and query/key offsets
+/// for constructing an attention mask, considering an optional KV cache.
+///
+/// This is useful for setting up `AttentionMaskConfig` in scenarios like
+/// auto-regressive decoding.
+///
+/// # Args
+/// * `cache_info`: Optional reference to `CacheInfo`, indicating the number of
+///                 tokens already processed and cached.
+/// * `current_query_length`: The length of the current query sequence.
+///
+/// # Returns
+/// A tuple `(mask_q_len, mask_kv_len, mask_q_offset, mask_kv_offset)`:
+///   - `mask_q_len`: The query length to use for mask generation (same as `current_query_length`).
+///   - `mask_kv_len`: The total key/value length the mask should cover.
+///   - `mask_q_offset`: The absolute starting position of the current query tokens.
+///   - `mask_kv_offset`: The absolute starting position of the key/value tokens the mask covers (always 0).
+pub fn get_mask_config_inputs_for_generation(
+    cache_info: Option<&CacheInfo>,
+    current_query_length: usize,
+) -> (usize, usize, usize, usize) {
+    let mask_q_len = current_query_length;
+    let mask_kv_len: usize;
+    let mask_q_offset: usize;
+    let mask_kv_offset: usize;
+
+    if let Some(cache) = cache_info {
+        let num_seen_tokens = cache.get_num_seen_tokens();
+        mask_kv_len = num_seen_tokens.checked_add(current_query_length)
+            .expect("Overflow calculating mask_kv_len with cache");
+        mask_q_offset = num_seen_tokens;
+        mask_kv_offset = 0;
+    } else {
+        mask_kv_len = current_query_length;
+        mask_q_offset = 0;
+        mask_kv_offset = 0;
+    }
+
+    (mask_q_len, mask_kv_len, mask_q_offset, mask_kv_offset)
+}
+
+pub fn build_attention_mask(config: &AttentionMaskConfig) -> Vec<Vec<bool>> {
+    let mut active_logics: Vec<MaskFunction> = Vec::new();
+
+    if config.is_causal {
+        active_logics.push(Box::new(causal_logic));
+    }
+
+    if let Some(window_size) = config.sliding_window {
+        active_logics.push(sliding_window_logic_fn(window_size));
+    }
+
+    if let Some(chunk_size_val) = config.chunk_size {
+        active_logics.push(chunked_logic_fn(chunk_size_val));
+    }
+
+    if let Some(padding_mask_arc) = &config.padding_mask {
+        active_logics.push(padding_mask_logic_fn(padding_mask_arc.clone()));
+    }
+
+    let mut combined_logic = and_masks_rust(active_logics);
+
+    if config.q_offset > 0 || config.kv_offset > 0 {
+        combined_logic = add_offsets_to_mask_function(combined_logic, config.q_offset, config.kv_offset);
+    }
+
+    generate_mask_from_logic(config.query_length, config.key_value_length, &combined_logic)
+}
+
 // --- Mask Composition and Utility Functions ---
 
 pub fn and_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
     Box::new(move |batch_idx, head_idx, q_idx, kv_idx| {
         if mask_functions.is_empty() {
-            return true; // Identity for AND
+            return true;
         }
         for func in &mask_functions {
             if !func(batch_idx, head_idx, q_idx, kv_idx) {
-                return false; // Short-circuit
+                return false;
             }
         }
         true
     })
 }
 
-/// Wraps an existing `MaskFunction` to apply offsets to the query and key/value indices
-/// before calling the original function.
-///
-/// # Args
-/// * `inner_mask_fn`: The `MaskFunction` to wrap. This function is moved into the closure.
-/// * `q_offset`: The offset to add to the `q_idx` passed to the `inner_mask_fn`.
-/// * `kv_offset`: The offset to add to the `kv_idx` passed to the `inner_mask_fn`.
-///
-/// # Returns
-/// A new `MaskFunction` that incorporates the specified offsets. If adding the offset
-/// to `q_idx` or `kv_idx` results in an overflow, the function will treat it as a
-/// masked position and return `false`.
 pub fn add_offsets_to_mask_function(
     inner_mask_fn: MaskFunction,
     q_offset: usize,
@@ -210,10 +311,10 @@ pub fn add_offsets_to_mask_function(
 ) -> MaskFunction {
     Box::new(move |batch_idx: usize, head_idx: usize, q_idx: usize, kv_idx: usize| {
         let Some(new_q_idx) = q_idx.checked_add(q_offset) else {
-            return false; // Overflow, treat as masked
+            return false;
         };
         let Some(new_kv_idx) = kv_idx.checked_add(kv_offset) else {
-            return false; // Overflow, treat as masked
+            return false;
         };
 
         inner_mask_fn(batch_idx, head_idx, new_q_idx, new_kv_idx)
@@ -223,11 +324,11 @@ pub fn add_offsets_to_mask_function(
 pub fn or_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
     Box::new(move |batch_idx, head_idx, q_idx, kv_idx| {
         if mask_functions.is_empty() {
-            return false; // Identity for OR
+            return false;
         }
         for func in &mask_functions {
             if func(batch_idx, head_idx, q_idx, kv_idx) {
-                return true; // Short-circuit
+                return true;
             }
         }
         false
@@ -247,7 +348,7 @@ pub fn generate_mask_from_logic(
     for q_idx in 0..query_length {
         let mut row = Vec::with_capacity(key_value_length);
         for kv_idx in 0..key_value_length {
-            if logic(0, 0, q_idx, kv_idx) { // Pass 0 for batch_idx, head_idx
+            if logic(0, 0, q_idx, kv_idx) {
                 row.push(true);
             } else {
                 row.push(false);
@@ -258,30 +359,16 @@ pub fn generate_mask_from_logic(
     mask
 }
 
-/// Creates a `MaskFunction` that uses a provided 2D padding mask.
-///
-/// The returned function, when called, checks the boolean value at
-/// `padding_mask[batch_idx][kv_idx]`.
-///
-/// # Args
-/// * `padding_mask`: An `Arc<Vec<Vec<bool>>>` representing the 2D padding mask.
-///                   `true` usually means attend, `false` means masked/padded.
-///                   The `Arc` allows the mask data to be shared efficiently.
-///
-/// # Returns
-/// A `MaskFunction` closure that captures the `padding_mask`.
-/// This closure will return `false` if `batch_idx` or `kv_idx` are out of bounds.
-/// It ignores `_head_idx` and `_q_idx` passed to the closure.
 pub fn padding_mask_logic_fn(padding_mask: Arc<Vec<Vec<bool>>>) -> MaskFunction {
     Box::new(move |batch_idx: usize, _head_idx: usize, _q_idx: usize, kv_idx: usize| {
         if let Some(row) = padding_mask.get(batch_idx) {
             if let Some(&value) = row.get(kv_idx) {
-                value // Return the value from the mask
+                value
             } else {
-                false // kv_idx is out of bounds for this row, so it's a masked position
+                false
             }
         } else {
-            false // batch_idx is out of bounds, so it's a masked position
+            false
         }
     })
 }
@@ -801,51 +888,45 @@ mod tests {
         ]);
         let padding_logic = padding_mask_logic_fn(mask_data);
 
-        // Test within bounds
-        assert_eq!(padding_logic(0,0,0,0), true);  // mask_data[0][0]
-        assert_eq!(padding_logic(0,0,0,1), false); // mask_data[0][1]
-        assert_eq!(padding_logic(1,0,0,1), true);  // mask_data[1][1]
-
-        // Test out of bounds for kv_idx
+        assert_eq!(padding_logic(0,0,0,0), true);
+        assert_eq!(padding_logic(0,0,0,1), false);
+        assert_eq!(padding_logic(1,0,0,1), true);
         assert_eq!(padding_logic(0,0,0,3), false);
-
-        // Test out of bounds for batch_idx
         assert_eq!(padding_logic(2,0,0,0), false);
     }
 
     #[test]
     fn test_padding_mask_logic_fn_empty_mask_data() {
-        let mask_data = Arc::new(Vec::new()); // Empty batch
+        let mask_data = Arc::new(Vec::new());
         let padding_logic = padding_mask_logic_fn(mask_data);
-        assert_eq!(padding_logic(0,0,0,0), false); // batch_idx 0 is out of bounds
+        assert_eq!(padding_logic(0,0,0,0), false);
     }
 
     #[test]
     fn test_padding_mask_logic_fn_empty_rows_in_mask_data() {
-        let mask_data = Arc::new(vec![Vec::new(), vec![true]]); // First row empty
+        let mask_data = Arc::new(vec![Vec::new(), vec![true]]);
         let padding_logic = padding_mask_logic_fn(mask_data);
 
-        assert_eq!(padding_logic(0,0,0,0), false); // kv_idx 0 out of bounds for empty row 0
-        assert_eq!(padding_logic(1,0,0,0), true);  // mask_data[1][0]
-        assert_eq!(padding_logic(1,0,0,1), false); // kv_idx 1 out of bounds for row 1
+        assert_eq!(padding_logic(0,0,0,0), false);
+        assert_eq!(padding_logic(1,0,0,0), true);
+        assert_eq!(padding_logic(1,0,0,1), false);
     }
 
     #[test]
     fn test_padding_mask_logic_fn_ignores_q_idx_head_idx() {
-        // Ensure that q_idx and head_idx don't affect the outcome, only batch_idx and kv_idx
         let mask_data = Arc::new(vec![vec![true, false]]);
         let padding_logic = padding_mask_logic_fn(mask_data);
 
         assert_eq!(padding_logic(0, 0, 0, 0), true);
-        assert_eq!(padding_logic(0, 10, 20, 0), true); // Different head_idx, q_idx, same result
+        assert_eq!(padding_logic(0, 10, 20, 0), true);
 
         assert_eq!(padding_logic(0, 0, 0, 1), false);
-        assert_eq!(padding_logic(0, 5, 15, 1), false); // Different head_idx, q_idx, same result
+        assert_eq!(padding_logic(0, 5, 15, 1), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_no_offset() {
-        let base_logic: MaskFunction = Box::new(|_b, _h, q, kv| q == kv); // Simple identity logic for diagonal
+        let base_logic: MaskFunction = Box::new(|_b, _h, q, kv| q == kv);
         let offset_logic = add_offsets_to_mask_function(base_logic, 0, 0);
 
         assert_eq!(offset_logic(0,0,0,0), true);
@@ -856,71 +937,107 @@ mod tests {
 
     #[test]
     fn test_add_offsets_to_mask_function_with_offsets() {
-        // Inner logic: true if new_q == new_kv
-        // (q + q_offset) == (kv + kv_offset)
-        // q + 10 == kv + 5  => q + 5 == kv
         let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q == new_kv);
         let offset_logic = add_offsets_to_mask_function(base_logic, 10, 5);
-                                        // batch, head, q, kv
-        assert_eq!(offset_logic(0,0,0,0), false); // 0+10 != 0+5 (10 != 5)
-        assert_eq!(offset_logic(0,0,0,5), true);  // 0+10 == 5+5 (10 == 10)
-        assert_eq!(offset_logic(0,0,1,6), true);  // 1+10 == 6+5 (11 == 11)
-        assert_eq!(offset_logic(0,0,1,5), false); // 1+10 != 5+5 (11 != 10)
+        assert_eq!(offset_logic(0,0,0,0), false);
+        assert_eq!(offset_logic(0,0,0,5), true);
+        assert_eq!(offset_logic(0,0,1,6), true);
+        assert_eq!(offset_logic(0,0,1,5), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_q_offset_only() {
-        // Inner logic: new_q >= new_kv (causal like)
-        // q + 5 >= kv
         let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q >= new_kv);
         let offset_logic = add_offsets_to_mask_function(base_logic, 5, 0);
-
-        assert_eq!(offset_logic(0,0,0,0), true);  // 0+5 >= 0 (5 >= 0)
-        assert_eq!(offset_logic(0,0,0,5), true);  // 0+5 >= 5 (5 >= 5)
-        assert_eq!(offset_logic(0,0,0,6), false); // 0+5 >= 6 (5 >= 6) -> false
+        assert_eq!(offset_logic(0,0,0,0), true);
+        assert_eq!(offset_logic(0,0,0,5), true);
+        assert_eq!(offset_logic(0,0,0,6), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_kv_offset_only() {
-        // Inner logic: new_q >= new_kv (causal like)
-        // q >= kv + 5
         let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q >= new_kv);
         let offset_logic = add_offsets_to_mask_function(base_logic, 0, 5);
-
-        assert_eq!(offset_logic(0,0,0,0), false); // 0 >= 0+5 (0 >= 5) -> false
-        assert_eq!(offset_logic(0,0,5,0), true);  // 5 >= 0+5 (5 >= 5)
-        assert_eq!(offset_logic(0,0,6,0), true);  // 6 >= 0+5 (6 >= 5)
-        assert_eq!(offset_logic(0,0,4,0), false); // 4 >= 0+5 (4 >= 5) -> false
+        assert_eq!(offset_logic(0,0,0,0), false);
+        assert_eq!(offset_logic(0,0,5,0), true);
+        assert_eq!(offset_logic(0,0,6,0), true);
+        assert_eq!(offset_logic(0,0,4,0), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_overflow_q() {
-        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true); // Inner logic always true
+        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true);
         let offset_logic = add_offsets_to_mask_function(base_logic, usize::MAX, 0);
-
-        assert_eq!(offset_logic(0,0,0,0), true);    // 0 + MAX is ok
-        assert_eq!(offset_logic(0,0,1,0), false);   // 1 + MAX overflows -> should be masked (false)
-        assert_eq!(offset_logic(0,0,10,0), false); // 10 + MAX overflows
+        assert_eq!(offset_logic(0,0,0,0), true);
+        assert_eq!(offset_logic(0,0,1,0), false);
+        assert_eq!(offset_logic(0,0,10,0), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_overflow_kv() {
-        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true); // Inner logic always true
+        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true);
         let offset_logic = add_offsets_to_mask_function(base_logic, 0, usize::MAX);
-
-        assert_eq!(offset_logic(0,0,0,0), true);    // 0 + MAX is ok
-        assert_eq!(offset_logic(0,0,0,1), false);   // 1 + MAX overflows -> should be masked (false)
+        assert_eq!(offset_logic(0,0,0,0), true);
+        assert_eq!(offset_logic(0,0,0,1), false);
     }
 
     #[test]
     fn test_add_offsets_to_mask_function_overflow_both() {
         let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true);
         let offset_logic = add_offsets_to_mask_function(base_logic, usize::MAX, usize::MAX);
-
         assert_eq!(offset_logic(0,0,0,0), true);
-        assert_eq!(offset_logic(0,0,1,0), false); // q overflows
-        assert_eq!(offset_logic(0,0,0,1), false); // kv overflows
-        assert_eq!(offset_logic(0,0,1,1), false); // both would overflow, q checked first
+        assert_eq!(offset_logic(0,0,1,0), false);
+        assert_eq!(offset_logic(0,0,0,1), false);
+        assert_eq!(offset_logic(0,0,1,1), false);
+    }
+
+    // --- Tests for CacheInfo and get_mask_config_inputs_for_generation ---
+    #[test]
+    fn test_cache_info() {
+        let cache = CacheInfo::new(100);
+        assert_eq!(cache.get_num_seen_tokens(), 100);
+        assert_eq!(cache.num_seen_tokens, 100); // Direct field access
+        let cache2 = CacheInfo { num_seen_tokens: 50 };
+        assert_eq!(cache2.get_num_seen_tokens(), 50);
+    }
+
+    #[test]
+    fn test_get_mask_config_inputs_no_cache() {
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(None, 10);
+        assert_eq!(q_len, 10);
+        assert_eq!(kv_len, 10);
+        assert_eq!(q_offset, 0);
+        assert_eq!(kv_offset, 0);
+    }
+
+    #[test]
+    fn test_get_mask_config_inputs_with_cache() {
+        let cache = CacheInfo::new(100);
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(Some(&cache), 10);
+        assert_eq!(q_len, 10); // Current query length
+        assert_eq!(kv_len, 110); // Seen tokens + current query
+        assert_eq!(q_offset, 100); // Query starts after seen tokens
+        assert_eq!(kv_offset, 0); // KV mask always starts from 0 for its full length
+    }
+
+    #[test]
+    fn test_get_mask_config_inputs_with_cache_query_len_1() {
+        let cache = CacheInfo::new(50);
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(Some(&cache), 1);
+        assert_eq!(q_len, 1);
+        assert_eq!(kv_len, 51);
+        assert_eq!(q_offset, 50);
+        assert_eq!(kv_offset, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Overflow calculating mask_kv_len with cache")]
+    fn test_get_mask_config_inputs_overflow() {
+        let cache = CacheInfo::new(usize::MAX - 5);
+        get_mask_config_inputs_for_generation(Some(&cache), 10);
     }
 }
 // This is the very end of the file. No more characters or lines after this.
