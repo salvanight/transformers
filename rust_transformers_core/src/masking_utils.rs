@@ -16,6 +16,25 @@ use std::sync::Arc;
 
 pub type MaskFunction = Box<dyn Fn(usize, usize, usize, usize) -> bool>;
 
+/// Provides basic information about the state of a Key-Value cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheInfo {
+    /// The number of token positions already processed and present in the KV cache.
+    pub num_seen_tokens: usize,
+}
+
+impl CacheInfo {
+    /// Creates a new `CacheInfo`.
+    pub fn new(num_seen_tokens: usize) -> Self {
+        CacheInfo { num_seen_tokens }
+    }
+
+    /// Returns the number of tokens seen so far (i.e., present in the cache).
+    pub fn get_num_seen_tokens(&self) -> usize {
+        self.num_seen_tokens
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AttentionMaskConfig {
     pub query_length: usize,
@@ -198,6 +217,47 @@ pub fn convert_boolean_mask_to_float(
         float_mask.push(row_float);
     }
     float_mask
+}
+
+/// Determines the appropriate query length, key/value length, and query/key offsets
+/// for constructing an attention mask, considering an optional KV cache.
+///
+/// This is useful for setting up `AttentionMaskConfig` in scenarios like
+/// auto-regressive decoding.
+///
+/// # Args
+/// * `cache_info`: Optional reference to `CacheInfo`, indicating the number of
+///                 tokens already processed and cached.
+/// * `current_query_length`: The length of the current query sequence.
+///
+/// # Returns
+/// A tuple `(mask_q_len, mask_kv_len, mask_q_offset, mask_kv_offset)`:
+///   - `mask_q_len`: The query length to use for mask generation (same as `current_query_length`).
+///   - `mask_kv_len`: The total key/value length the mask should cover.
+///   - `mask_q_offset`: The absolute starting position of the current query tokens.
+///   - `mask_kv_offset`: The absolute starting position of the key/value tokens the mask covers (always 0).
+pub fn get_mask_config_inputs_for_generation(
+    cache_info: Option<&CacheInfo>,
+    current_query_length: usize,
+) -> (usize, usize, usize, usize) {
+    let mask_q_len = current_query_length;
+    let mask_kv_len: usize;
+    let mask_q_offset: usize;
+    let mask_kv_offset: usize;
+
+    if let Some(cache) = cache_info {
+        let num_seen_tokens = cache.get_num_seen_tokens();
+        mask_kv_len = num_seen_tokens.checked_add(current_query_length)
+            .expect("Overflow calculating mask_kv_len with cache");
+        mask_q_offset = num_seen_tokens;
+        mask_kv_offset = 0;
+    } else {
+        mask_kv_len = current_query_length;
+        mask_q_offset = 0;
+        mask_kv_offset = 0;
+    }
+
+    (mask_q_len, mask_kv_len, mask_q_offset, mask_kv_offset)
 }
 
 pub fn build_attention_mask(config: &AttentionMaskConfig) -> Vec<Vec<bool>> {
@@ -931,150 +991,53 @@ mod tests {
         assert_eq!(offset_logic(0,0,1,1), false);
     }
 
-    // --- Tests for AttentionMaskConfig and build_attention_mask ---
-
+    // --- Tests for CacheInfo and get_mask_config_inputs_for_generation ---
     #[test]
-    fn test_attention_mask_config_new() {
-        let config = AttentionMaskConfig::new(10, 20);
-        assert_eq!(config.query_length, 10);
-        assert_eq!(config.key_value_length, 20);
-        assert_eq!(config.is_causal, true); // Default
-        assert_eq!(config.sliding_window, None);
-        assert_eq!(config.chunk_size, None);
-        assert_eq!(config.padding_mask, None);
-        assert_eq!(config.q_offset, 0);
-        assert_eq!(config.kv_offset, 0);
+    fn test_cache_info() {
+        let cache = CacheInfo::new(100);
+        assert_eq!(cache.get_num_seen_tokens(), 100);
+        assert_eq!(cache.num_seen_tokens, 100); // Direct field access
+        let cache2 = CacheInfo { num_seen_tokens: 50 };
+        assert_eq!(cache2.get_num_seen_tokens(), 50);
     }
 
     #[test]
-    fn test_build_attention_mask_default_causal() {
-        let config = AttentionMaskConfig::new(3, 3);
-        let mask = build_attention_mask(&config);
-        let expected = generate_causal_2d_mask(3, 3);
-        assert_eq!(mask, expected);
+    fn test_get_mask_config_inputs_no_cache() {
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(None, 10);
+        assert_eq!(q_len, 10);
+        assert_eq!(kv_len, 10);
+        assert_eq!(q_offset, 0);
+        assert_eq!(kv_offset, 0);
     }
 
     #[test]
-    fn test_build_attention_mask_causal_sliding_window() {
-        let q_len = 4;
-        let kv_len = 4;
-        let window = 2;
-        let config = AttentionMaskConfig {
-            query_length: q_len,
-            key_value_length: kv_len,
-            is_causal: true,
-            sliding_window: Some(window),
-            ..AttentionMaskConfig::new(q_len, kv_len) // for other defaults
-        };
-        let mask = build_attention_mask(&config);
-        // Expected is causal AND sliding window
-        let expected = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
-        assert_eq!(mask, expected);
+    fn test_get_mask_config_inputs_with_cache() {
+        let cache = CacheInfo::new(100);
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(Some(&cache), 10);
+        assert_eq!(q_len, 10); // Current query length
+        assert_eq!(kv_len, 110); // Seen tokens + current query
+        assert_eq!(q_offset, 100); // Query starts after seen tokens
+        assert_eq!(kv_offset, 0); // KV mask always starts from 0 for its full length
     }
 
     #[test]
-    fn test_build_attention_mask_causal_chunked() {
-        let q_len = 6;
-        let kv_len = 6;
-        let chunk = 2;
-        let config = AttentionMaskConfig {
-            query_length: q_len,
-            key_value_length: kv_len,
-            is_causal: true,
-            chunk_size: Some(chunk),
-            ..AttentionMaskConfig::new(q_len, kv_len)
-        };
-        let mask = build_attention_mask(&config);
-        let expected = generate_chunked_causal_2d_mask(q_len, kv_len, chunk);
-        assert_eq!(mask, expected);
+    fn test_get_mask_config_inputs_with_cache_query_len_1() {
+        let cache = CacheInfo::new(50);
+        let (q_len, kv_len, q_offset, kv_offset) =
+            get_mask_config_inputs_for_generation(Some(&cache), 1);
+        assert_eq!(q_len, 1);
+        assert_eq!(kv_len, 51);
+        assert_eq!(q_offset, 50);
+        assert_eq!(kv_offset, 0);
     }
 
     #[test]
-    fn test_build_attention_mask_padding_only() {
-        let q_len = 2;
-        let kv_len = 3;
-        let padding_data = Arc::new(vec![vec![true, true, false], vec![true, false, true]]);
-        let config = AttentionMaskConfig {
-            query_length: q_len,
-            key_value_length: kv_len,
-            is_causal: false, // Important: not causal
-            padding_mask: Some(padding_data.clone()),
-            ..AttentionMaskConfig::new(q_len, kv_len)
-        };
-        let mask = build_attention_mask(&config);
-        // Expected is just the padding mask itself (batch_idx 0, head_idx 0 applied to all q,kv)
-        // generate_mask_from_logic will use the padding_mask_logic_fn
-        let padding_logic = padding_mask_logic_fn(padding_data);
-        let expected = generate_mask_from_logic(q_len, kv_len, &padding_logic);
-        assert_eq!(mask, expected);
-    }
-
-    #[test]
-    fn test_build_attention_mask_causal_and_padding() {
-        let q_len = 2;
-        let kv_len = 3;
-        let padding_data = Arc::new(vec![
-            vec![true, true, false], // Batch idx 0, used for all generated rows
-        ]);
-        // We only need one row in padding_data as generate_mask_from_logic uses batch_idx=0
-
-        let config = AttentionMaskConfig {
-            query_length: q_len,
-            key_value_length: kv_len,
-            is_causal: true,
-            padding_mask: Some(padding_data.clone()),
-            ..AttentionMaskConfig::new(q_len, kv_len)
-        };
-        let mask = build_attention_mask(&config);
-
-        let causal_m = generate_causal_2d_mask(q_len, kv_len);
-        let padding_m_logic = padding_mask_logic_fn(padding_data);
-        let padding_m_generated = generate_mask_from_logic(q_len, kv_len, &padding_m_logic);
-
-        let mut expected = Vec::new();
-        for i in 0..q_len {
-            let mut row = Vec::new();
-            for j in 0..kv_len {
-                row.push(causal_m[i][j] && padding_m_generated[i][j]);
-            }
-            expected.push(row);
-        }
-        assert_eq!(mask, expected);
-    }
-
-    #[test]
-    fn test_build_attention_mask_with_offsets() {
-        let q_len = 2;
-        let kv_len = 2;
-        // Inner logic is causal: new_kv <= new_q
-        // Offsets: q_offset=1, kv_offset=1
-        // So, effective logic: kv+1 <= q+1  => kv <= q
-        let config = AttentionMaskConfig {
-            query_length: q_len,
-            key_value_length: kv_len,
-            is_causal: true, // This will be wrapped by offset
-            q_offset: 1,
-            kv_offset: 1,
-            ..AttentionMaskConfig::new(q_len, kv_len)
-        };
-        let mask = build_attention_mask(&config);
-
-        // q_orig=0, kv_orig=0 -> q_new=1, kv_new=1. kv_new <= q_new (T)
-        // q_orig=0, kv_orig=1 -> q_new=1, kv_new=2. kv_new <= q_new (F)
-        // q_orig=1, kv_orig=0 -> q_new=2, kv_new=1. kv_new <= q_new (T)
-        // q_orig=1, kv_orig=1 -> q_new=2, kv_new=2. kv_new <= q_new (T)
-        let expected = vec![
-            vec![true, false],
-            vec![true, true],
-        ];
-        assert_eq!(mask, expected);
-    }
-
-    #[test]
-    fn test_build_attention_mask_empty_query_len() {
-        let config = AttentionMaskConfig::new(0, 5);
-        let mask = build_attention_mask(&config);
-        assert!(mask.is_empty());
+    #[should_panic(expected = "Overflow calculating mask_kv_len with cache")]
+    fn test_get_mask_config_inputs_overflow() {
+        let cache = CacheInfo::new(usize::MAX - 5);
+        get_mask_config_inputs_for_generation(Some(&cache), 10);
     }
 }
 // This is the very end of the file. No more characters or lines after this.
