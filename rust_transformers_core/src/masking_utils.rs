@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::sync::Arc; // Added Arc
+
 pub type MaskFunction = Box<dyn Fn(usize, usize, usize, usize) -> bool>;
 
 pub fn prepare_padding_mask(
@@ -189,6 +191,35 @@ pub fn and_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
     })
 }
 
+/// Wraps an existing `MaskFunction` to apply offsets to the query and key/value indices
+/// before calling the original function.
+///
+/// # Args
+/// * `inner_mask_fn`: The `MaskFunction` to wrap. This function is moved into the closure.
+/// * `q_offset`: The offset to add to the `q_idx` passed to the `inner_mask_fn`.
+/// * `kv_offset`: The offset to add to the `kv_idx` passed to the `inner_mask_fn`.
+///
+/// # Returns
+/// A new `MaskFunction` that incorporates the specified offsets. If adding the offset
+/// to `q_idx` or `kv_idx` results in an overflow, the function will treat it as a
+/// masked position and return `false`.
+pub fn add_offsets_to_mask_function(
+    inner_mask_fn: MaskFunction,
+    q_offset: usize,
+    kv_offset: usize,
+) -> MaskFunction {
+    Box::new(move |batch_idx: usize, head_idx: usize, q_idx: usize, kv_idx: usize| {
+        let Some(new_q_idx) = q_idx.checked_add(q_offset) else {
+            return false; // Overflow, treat as masked
+        };
+        let Some(new_kv_idx) = kv_idx.checked_add(kv_offset) else {
+            return false; // Overflow, treat as masked
+        };
+
+        inner_mask_fn(batch_idx, head_idx, new_q_idx, new_kv_idx)
+    })
+}
+
 pub fn or_masks_rust(mask_functions: Vec<MaskFunction>) -> MaskFunction {
     Box::new(move |batch_idx, head_idx, q_idx, kv_idx| {
         if mask_functions.is_empty() {
@@ -225,6 +256,34 @@ pub fn generate_mask_from_logic(
         mask.push(row);
     }
     mask
+}
+
+/// Creates a `MaskFunction` that uses a provided 2D padding mask.
+///
+/// The returned function, when called, checks the boolean value at
+/// `padding_mask[batch_idx][kv_idx]`.
+///
+/// # Args
+/// * `padding_mask`: An `Arc<Vec<Vec<bool>>>` representing the 2D padding mask.
+///                   `true` usually means attend, `false` means masked/padded.
+///                   The `Arc` allows the mask data to be shared efficiently.
+///
+/// # Returns
+/// A `MaskFunction` closure that captures the `padding_mask`.
+/// This closure will return `false` if `batch_idx` or `kv_idx` are out of bounds.
+/// It ignores `_head_idx` and `_q_idx` passed to the closure.
+pub fn padding_mask_logic_fn(padding_mask: Arc<Vec<Vec<bool>>>) -> MaskFunction {
+    Box::new(move |batch_idx: usize, _head_idx: usize, _q_idx: usize, kv_idx: usize| {
+        if let Some(row) = padding_mask.get(batch_idx) {
+            if let Some(&value) = row.get(kv_idx) {
+                value // Return the value from the mask
+            } else {
+                false // kv_idx is out of bounds for this row, so it's a masked position
+            }
+        } else {
+            false // batch_idx is out of bounds, so it's a masked position
+        }
+    })
 }
 
 // --- Primitive Mask Logic Functions (private helpers) ---
@@ -732,6 +791,136 @@ mod tests {
         let generated = generate_mask_from_logic(q_len, kv_len, &combined_logic);
         let expected = generate_sliding_window_causal_2d_mask(q_len, kv_len, window);
         assert_eq!(generated, expected);
+    }
+
+    #[test]
+    fn test_padding_mask_logic_fn_basic() {
+        let mask_data = Arc::new(vec![
+            vec![true, false, true],
+            vec![false, true, true],
+        ]);
+        let padding_logic = padding_mask_logic_fn(mask_data);
+
+        // Test within bounds
+        assert_eq!(padding_logic(0,0,0,0), true);  // mask_data[0][0]
+        assert_eq!(padding_logic(0,0,0,1), false); // mask_data[0][1]
+        assert_eq!(padding_logic(1,0,0,1), true);  // mask_data[1][1]
+
+        // Test out of bounds for kv_idx
+        assert_eq!(padding_logic(0,0,0,3), false);
+
+        // Test out of bounds for batch_idx
+        assert_eq!(padding_logic(2,0,0,0), false);
+    }
+
+    #[test]
+    fn test_padding_mask_logic_fn_empty_mask_data() {
+        let mask_data = Arc::new(Vec::new()); // Empty batch
+        let padding_logic = padding_mask_logic_fn(mask_data);
+        assert_eq!(padding_logic(0,0,0,0), false); // batch_idx 0 is out of bounds
+    }
+
+    #[test]
+    fn test_padding_mask_logic_fn_empty_rows_in_mask_data() {
+        let mask_data = Arc::new(vec![Vec::new(), vec![true]]); // First row empty
+        let padding_logic = padding_mask_logic_fn(mask_data);
+
+        assert_eq!(padding_logic(0,0,0,0), false); // kv_idx 0 out of bounds for empty row 0
+        assert_eq!(padding_logic(1,0,0,0), true);  // mask_data[1][0]
+        assert_eq!(padding_logic(1,0,0,1), false); // kv_idx 1 out of bounds for row 1
+    }
+
+    #[test]
+    fn test_padding_mask_logic_fn_ignores_q_idx_head_idx() {
+        // Ensure that q_idx and head_idx don't affect the outcome, only batch_idx and kv_idx
+        let mask_data = Arc::new(vec![vec![true, false]]);
+        let padding_logic = padding_mask_logic_fn(mask_data);
+
+        assert_eq!(padding_logic(0, 0, 0, 0), true);
+        assert_eq!(padding_logic(0, 10, 20, 0), true); // Different head_idx, q_idx, same result
+
+        assert_eq!(padding_logic(0, 0, 0, 1), false);
+        assert_eq!(padding_logic(0, 5, 15, 1), false); // Different head_idx, q_idx, same result
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_no_offset() {
+        let base_logic: MaskFunction = Box::new(|_b, _h, q, kv| q == kv); // Simple identity logic for diagonal
+        let offset_logic = add_offsets_to_mask_function(base_logic, 0, 0);
+
+        assert_eq!(offset_logic(0,0,0,0), true);
+        assert_eq!(offset_logic(0,0,0,1), false);
+        assert_eq!(offset_logic(0,0,1,0), false);
+        assert_eq!(offset_logic(0,0,1,1), true);
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_with_offsets() {
+        // Inner logic: true if new_q == new_kv
+        // (q + q_offset) == (kv + kv_offset)
+        // q + 10 == kv + 5  => q + 5 == kv
+        let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q == new_kv);
+        let offset_logic = add_offsets_to_mask_function(base_logic, 10, 5);
+                                        // batch, head, q, kv
+        assert_eq!(offset_logic(0,0,0,0), false); // 0+10 != 0+5 (10 != 5)
+        assert_eq!(offset_logic(0,0,0,5), true);  // 0+10 == 5+5 (10 == 10)
+        assert_eq!(offset_logic(0,0,1,6), true);  // 1+10 == 6+5 (11 == 11)
+        assert_eq!(offset_logic(0,0,1,5), false); // 1+10 != 5+5 (11 != 10)
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_q_offset_only() {
+        // Inner logic: new_q >= new_kv (causal like)
+        // q + 5 >= kv
+        let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q >= new_kv);
+        let offset_logic = add_offsets_to_mask_function(base_logic, 5, 0);
+
+        assert_eq!(offset_logic(0,0,0,0), true);  // 0+5 >= 0 (5 >= 0)
+        assert_eq!(offset_logic(0,0,0,5), true);  // 0+5 >= 5 (5 >= 5)
+        assert_eq!(offset_logic(0,0,0,6), false); // 0+5 >= 6 (5 >= 6) -> false
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_kv_offset_only() {
+        // Inner logic: new_q >= new_kv (causal like)
+        // q >= kv + 5
+        let base_logic: MaskFunction = Box::new(|_b, _h, new_q, new_kv| new_q >= new_kv);
+        let offset_logic = add_offsets_to_mask_function(base_logic, 0, 5);
+
+        assert_eq!(offset_logic(0,0,0,0), false); // 0 >= 0+5 (0 >= 5) -> false
+        assert_eq!(offset_logic(0,0,5,0), true);  // 5 >= 0+5 (5 >= 5)
+        assert_eq!(offset_logic(0,0,6,0), true);  // 6 >= 0+5 (6 >= 5)
+        assert_eq!(offset_logic(0,0,4,0), false); // 4 >= 0+5 (4 >= 5) -> false
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_overflow_q() {
+        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true); // Inner logic always true
+        let offset_logic = add_offsets_to_mask_function(base_logic, usize::MAX, 0);
+
+        assert_eq!(offset_logic(0,0,0,0), true);    // 0 + MAX is ok
+        assert_eq!(offset_logic(0,0,1,0), false);   // 1 + MAX overflows -> should be masked (false)
+        assert_eq!(offset_logic(0,0,10,0), false); // 10 + MAX overflows
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_overflow_kv() {
+        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true); // Inner logic always true
+        let offset_logic = add_offsets_to_mask_function(base_logic, 0, usize::MAX);
+
+        assert_eq!(offset_logic(0,0,0,0), true);    // 0 + MAX is ok
+        assert_eq!(offset_logic(0,0,0,1), false);   // 1 + MAX overflows -> should be masked (false)
+    }
+
+    #[test]
+    fn test_add_offsets_to_mask_function_overflow_both() {
+        let base_logic: MaskFunction = Box::new(|_b, _h, _q, _kv| true);
+        let offset_logic = add_offsets_to_mask_function(base_logic, usize::MAX, usize::MAX);
+
+        assert_eq!(offset_logic(0,0,0,0), true);
+        assert_eq!(offset_logic(0,0,1,0), false); // q overflows
+        assert_eq!(offset_logic(0,0,0,1), false); // kv overflows
+        assert_eq!(offset_logic(0,0,1,1), false); // both would overflow, q checked first
     }
 }
 // This is the very end of the file. No more characters or lines after this.
