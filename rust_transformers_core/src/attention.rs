@@ -7,6 +7,70 @@ use crate::rope_utils;
 type Matrix = Vec<Vec<f64>>;
 type Vector = Vec<f64>;
 
+// --- MHA Parameter Struct ---
+#[derive(Clone, Debug)]
+pub struct MultiHeadAttentionParams {
+    pub embed_dim: usize,
+    pub num_heads: usize,
+    pub head_dim: usize, // Derived: embed_dim / num_heads
+    pub w_q: Matrix, pub b_q: Option<Vector>,
+    pub w_k: Matrix, pub b_k: Option<Vector>,
+    pub w_v: Matrix, pub b_v: Option<Vector>,
+    pub w_o: Matrix, pub b_o: Option<Vector>,
+}
+
+impl MultiHeadAttentionParams {
+    pub fn new(
+        embed_dim: usize,
+        num_heads: usize,
+        w_q: Matrix, b_q: Option<Vector>,
+        w_k: Matrix, b_k: Option<Vector>,
+        w_v: Matrix, b_v: Option<Vector>,
+        w_o: Matrix, b_o: Option<Vector>,
+    ) -> Result<Self, String> {
+        if num_heads == 0 {
+            return Err("num_heads cannot be zero.".to_string());
+        }
+        if embed_dim % num_heads != 0 {
+            return Err(format!("embed_dim ({}) must be divisible by num_heads ({}).", embed_dim, num_heads));
+        }
+        let head_dim = embed_dim / num_heads;
+
+        // Validate weight and bias dimensions based on embed_dim and head_dim (implicitly num_heads * head_dim)
+        // w_q, w_k, w_v: [embed_dim, embed_dim] (or [num_heads * head_dim, num_heads * head_dim])
+        // b_q, b_k, b_v: [embed_dim]
+        // w_o: [embed_dim, embed_dim]
+        // b_o: [embed_dim]
+
+        if w_q.len() != embed_dim || (!w_q.is_empty() && w_q[0].len() != embed_dim) {
+            return Err(format!("w_q dimensions are invalid. Expected [{}, {}], got [{}, {}]", embed_dim, embed_dim, w_q.len(), if w_q.is_empty() {0} else {w_q[0].len()}));
+        }
+        if let Some(ref b) = b_q { if b.len() != embed_dim { return Err("b_q dimension mismatch.".to_string()); }}
+
+        if w_k.len() != embed_dim || (!w_k.is_empty() && w_k[0].len() != embed_dim) {
+             return Err(format!("w_k dimensions are invalid. Expected [{}, {}], got [{}, {}]", embed_dim, embed_dim, w_k.len(), if w_k.is_empty() {0} else {w_k[0].len()}));
+        }
+        if let Some(ref b) = b_k { if b.len() != embed_dim { return Err("b_k dimension mismatch.".to_string()); }}
+
+        if w_v.len() != embed_dim || (!w_v.is_empty() && w_v[0].len() != embed_dim) {
+            return Err(format!("w_v dimensions are invalid. Expected [{}, {}], got [{}, {}]", embed_dim, embed_dim, w_v.len(), if w_v.is_empty() {0} else {w_v[0].len()}));
+        }
+        if let Some(ref b) = b_v { if b.len() != embed_dim { return Err("b_v dimension mismatch.".to_string()); }}
+
+        if w_o.len() != embed_dim || (!w_o.is_empty() && w_o[0].len() != embed_dim) {
+            return Err(format!("w_o dimensions are invalid. Expected [{}, {}], got [{}, {}]", embed_dim, embed_dim, w_o.len(), if w_o.is_empty() {0} else {w_o[0].len()}));
+        }
+        if let Some(ref b) = b_o { if b.len() != embed_dim { return Err("b_o dimension mismatch.".to_string()); }}
+
+
+        Ok(Self {
+            embed_dim, num_heads, head_dim,
+            w_q, b_q, w_k, b_k, w_v, b_v, w_o, b_o,
+        })
+    }
+}
+
+
 /// Transposes a 2D matrix.
 fn transpose(matrix: &Matrix) -> Matrix {
     if matrix.is_empty() { return Vec::new(); }
@@ -90,6 +154,110 @@ fn softmax_vector(vector: &Vector) -> Vector {
     exp_values
 }
 
+// --- MHA Helper Functions ---
+fn split_into_heads(
+    combined_matrix: &Matrix,
+    num_heads: usize,
+) -> Vec<Matrix> {
+    if num_heads == 0 { panic!("num_heads cannot be zero."); }
+    if combined_matrix.is_empty() { return vec![Vec::new(); num_heads]; }
+    let seq_len = combined_matrix.len();
+    let combined_dim = combined_matrix[0].len();
+    if combined_dim % num_heads != 0 { panic!("Combined dimension ({}) is not divisible by num_heads ({}).", combined_dim, num_heads); }
+    let head_dim = combined_dim / num_heads;
+    if head_dim == 0 && combined_dim != 0 { panic!("Head dimension would be zero because num_heads ({}) > combined_dim ({}).", num_heads, combined_dim); }
+    if head_dim == 0 && combined_dim == 0 { return vec![vec![vec![]; seq_len]; num_heads]; }
+    let mut heads_data: Vec<Matrix> = vec![vec![Vec::with_capacity(head_dim); seq_len]; num_heads];
+    for s_idx in 0..seq_len {
+        if combined_matrix[s_idx].len() != combined_dim { panic!("Input matrix to split_into_heads is not rectangular at row {}.", s_idx); }
+        for h_idx in 0..num_heads {
+            for d_idx in 0..head_dim {
+                heads_data[h_idx][s_idx].push(combined_matrix[s_idx][h_idx * head_dim + d_idx]);
+            }
+        }
+    }
+    heads_data
+}
+
+fn concatenate_heads(
+    heads: &[Matrix],
+) -> Matrix {
+    if heads.is_empty() { return Vec::new(); }
+    if heads[0].is_empty() { return Vec::new(); }
+    let num_heads = heads.len();
+    let seq_len = heads[0].len();
+    let head_dim = if seq_len > 0 && !heads[0][0].is_empty() { heads[0][0].len() } else { 0 } ;
+    for h_idx in 0..num_heads {
+        if heads[h_idx].len() != seq_len { panic!("Head {} has inconsistent seq_len: expected {}, got {}.", h_idx, seq_len, heads[h_idx].len()); }
+        for s_idx in 0..seq_len {
+            if heads[h_idx][s_idx].len() != head_dim { panic!("Head {} at seq_idx {} has inconsistent head_dim: expected {}, got {}.", h_idx, s_idx, head_dim, heads[h_idx][s_idx].len()); }
+        }
+    }
+    let combined_dim = num_heads * head_dim;
+    if seq_len == 0 { return Vec::new(); }
+    let mut concatenated_matrix = vec![Vec::with_capacity(combined_dim); seq_len];
+    for s_idx in 0..seq_len {
+        for h_idx in 0..num_heads {
+            if head_dim > 0 { concatenated_matrix[s_idx].extend_from_slice(&heads[h_idx][s_idx]); }
+        }
+    }
+    concatenated_matrix
+}
+
+// --- Public Attention Functions ---
+
+pub fn linear_projection(
+    input: &Matrix,
+    weight: &Matrix,
+    bias: Option<&Vector>,
+) -> Matrix {
+    if input.is_empty() {
+        let out_features = if !weight.is_empty() { weight.len() } else { bias.map_or(0, |b| b.len()) };
+        if let Some(b) = bias {
+            if b.len() != out_features && !(b.is_empty() && out_features == 0) {
+                 panic!("Bias dimension ({}) does not match out_features ({}) determined from weight when input is empty.", b.len(), out_features);
+            }
+        }
+        return vec![vec![0.0; out_features]; 0];
+    }
+    let n_input_rows = input.len();
+    let in_features_input = input[0].len();
+    for i in 1..n_input_rows {
+        if input[i].len() != in_features_input { panic!("Input matrix is not rectangular at row {}.", i); }
+    }
+    let out_features = weight.len();
+    let in_features_weight = if out_features > 0 { weight[0].len() } else { in_features_input };
+    if in_features_input != in_features_weight {
+        panic!("Input features ({}) do not match weight in_features ({}). Input: [{},{}], Weight: [{},{}]",
+                in_features_input, in_features_weight, n_input_rows, in_features_input, out_features, in_features_weight);
+    }
+    if out_features == 0 {
+        if let Some(b) = bias { if !b.is_empty() { panic!("Bias provided for 0 output features."); } }
+        return vec![vec![]; n_input_rows];
+    }
+    if out_features > 0 {
+        for r in 0..out_features {
+            if weight[r].len() != in_features_weight { panic!("Weight matrix is not rectangular at row {}.", r); }
+        }
+    }
+    let mut output;
+    if in_features_input == 0 {
+        output = vec![vec![0.0; out_features]; n_input_rows];
+    } else {
+        let weight_t = transpose(weight);
+        output = matmul(input, &weight_t);
+    }
+    if let Some(b) = bias {
+        if b.len() != out_features { panic!("Bias dimension ({}) does not match out_features ({}).", b.len(), out_features); }
+        if n_input_rows > 0 && out_features > 0 {
+            for i in 0..n_input_rows {
+                for j in 0..out_features { output[i][j] += b[j]; }
+            }
+        }
+    }
+    output
+}
+
 pub fn scaled_dot_product_attention_simple(
     query: &Matrix,
     key: &Matrix,
@@ -107,7 +275,6 @@ pub fn scaled_dot_product_attention_simple(
     let kv_len = key.len();
     if key.is_empty() || key[0].len() != k_dim { panic!("Key matrix k_dim ({}) does not match query k_dim ({}).", if key.is_empty() {0} else {key[0].len()}, k_dim); }
 
-
     if value.is_empty() { panic!("Value matrix cannot be empty if key/query are not empty."); }
     let v_dim = value[0].len();
     if value.len() != kv_len { panic!("Value matrix kv_len ({}) does not match key matrix kv_len ({}).", value.len(), kv_len); }
@@ -119,27 +286,20 @@ pub fn scaled_dot_product_attention_simple(
         }
     }
 
-    if k_dim == 0 {
-        return vec![vec![0.0; v_dim]; q_len];
-    }
+    if k_dim == 0 { return vec![vec![0.0; v_dim]; q_len]; }
 
     let mut q_for_rope_owned: Matrix;
     let mut k_for_rope_owned: Matrix;
-
     let query_to_use: &Matrix;
     let key_to_use: &Matrix;
 
     if let Some(freqs) = inv_freq {
-        if freqs.len() * 2 != k_dim {
-            panic!("RoPE inv_freq length ({}) * 2 does not match k_dim ({}).", freqs.len(), k_dim);
-        }
-
+        if freqs.len() * 2 != k_dim { panic!("RoPE inv_freq length ({}) * 2 does not match k_dim ({}).", freqs.len(), k_dim); }
         q_for_rope_owned = query.clone();
         let mut q_batch_like = vec![q_for_rope_owned];
         rope_utils::apply_rotary_pos_emb(&mut q_batch_like, freqs, position_offset);
         q_for_rope_owned = q_batch_like.remove(0);
         query_to_use = &q_for_rope_owned;
-
         k_for_rope_owned = key.clone();
         let mut k_batch_like = vec![k_for_rope_owned];
         rope_utils::apply_rotary_pos_emb(&mut k_batch_like, freqs, position_offset);
@@ -152,14 +312,11 @@ pub fn scaled_dot_product_attention_simple(
 
     let key_t = transpose(key_to_use);
     let mut scores = matmul(query_to_use, &key_t);
-
     let scale = (k_dim as f64).sqrt();
-    if scale == 0.0 { panic!("k_dim is 0, cannot scale attention scores (should have been caught earlier)."); }
+    if scale == 0.0 { panic!("k_dim is 0, cannot scale attention scores."); }
 
     for i in 0..q_len {
-        if scores[i].len() != kv_len {
-            panic!("Scores row {} length {} does not match kv_len {}.", i, scores[i].len(), kv_len);
-        }
+        if scores[i].len() != kv_len { panic!("Scores row {} length {} does not match kv_len {}.", i, scores[i].len(), kv_len); }
         for j in 0..kv_len {
             scores[i][j] /= scale;
             if let Some(mask) = attention_mask {
@@ -170,92 +327,86 @@ pub fn scaled_dot_product_attention_simple(
         }
         scores[i] = softmax_vector(&scores[i]);
     }
-
     matmul(&scores, value)
 }
 
-pub fn linear_projection(
-    input: &Matrix,
-    weight: &Matrix,
-    bias: Option<&Vector>,
+pub fn multi_head_attention(
+    x_q: &Matrix,
+    x_kv: &Matrix,
+    params: &MultiHeadAttentionParams,
+    attention_mask: Option<&Matrix>,
+    inv_freq: Option<&Vec<f64>>,
+    position_offset: usize,
+    _dropout_p: f64,
 ) -> Matrix {
-    if input.is_empty() {
-        let out_features = if !weight.is_empty() { weight.len() } else { bias.map_or(0, |b| b.len()) };
-        if let Some(b) = bias {
-            if b.len() != out_features && !(b.is_empty() && out_features == 0) {
-                 panic!("Bias dimension ({}) does not match out_features ({}) determined from weight when input is empty.", b.len(), out_features);
-            }
-        }
-        return vec![vec![0.0; out_features]; 0];
-    }
+    if x_q.is_empty() { return Vec::new(); }
+    let q_seq_len = x_q.len();
+    if x_q[0].len() != params.embed_dim { panic!("x_q input dimension ({}) does not match params.embed_dim ({}).", x_q[0].len(), params.embed_dim); }
 
-    let n_input_rows = input.len();
-    let in_features_input = input[0].len();
+    let kv_seq_len = if x_kv.is_empty() { 0 } else { x_kv.len() };
+    if kv_seq_len == 0 && q_seq_len > 0 { panic!("x_kv cannot be empty if x_q is not empty."); }
+    if !x_kv.is_empty() && x_kv[0].len() != params.embed_dim { panic!("x_kv input dimension ({}) does not match params.embed_dim ({}).", x_kv[0].len(), params.embed_dim); }
 
-    for i in 1..n_input_rows {
-        if input[i].len() != in_features_input {
-            panic!("Input matrix is not rectangular at row {}.", i);
+    if let Some(mask) = attention_mask {
+        if mask.len() != q_seq_len { panic!("Attention mask q_len ({}) does not match query q_len ({}).", mask.len(), q_seq_len); }
+        if !mask.is_empty() && !mask[0].is_empty() && mask[0].len() != kv_seq_len {
+                panic!("Attention mask kv_len ({}) does not match key/value kv_len ({}).", mask[0].len(), kv_seq_len);
         }
     }
-
-    let out_features = weight.len();
-    // If weight is empty (0 rows), in_features_weight is conceptually undefined from its structure.
-    // However, for matmul [N, K] @ [K, M]^T = [N, K] @ [M, K],
-    // if M (out_features) is 0, weight is 0xK. in_features_weight should be K.
-    // If weight = Vec::new() (0 rows), we infer out_features = 0.
-    // in_features_weight should match in_features_input for the operation to be valid (even if 0x0 @ 0xN).
-    let in_features_weight = if out_features > 0 {
-        weight[0].len()
-    } else {
-        // If weight has 0 rows (out_features is 0), its number of columns (in_features_weight)
-        // must match in_features_input for the linear layer to be well-defined.
-        // e.g. Input: NxK, Weight: 0xK -> Output: Nx0
-        in_features_input
-    };
-
-
-    if in_features_input != in_features_weight {
-         // This condition implies that if out_features > 0, then weight[0].len() != in_features_input
-         // If out_features == 0, then this implies in_features_input != in_features_input (false), so it wouldn't panic here.
-         // This should be fine.
-        panic!("Input features ({}) do not match weight in_features ({}). Input: [{},{}], Weight: [{},{}]",
-                in_features_input, in_features_weight, n_input_rows, in_features_input, out_features, in_features_weight);
-    }
-
-    if out_features == 0 {
-        if let Some(b) = bias { if !b.is_empty() { panic!("Bias provided for 0 output features."); } }
-        return vec![vec![]; n_input_rows]; // N x 0 output
-    }
-
-    if out_features > 0 { // Redundant due to above, but good for clarity before accessing weight[r]
-        for r in 0..out_features {
-            if weight[r].len() != in_features_weight {
-                panic!("Weight matrix is not rectangular at row {}.", r);
-            }
+    if let Some(freqs) = inv_freq {
+        if params.head_dim == 0 && !freqs.is_empty() { panic!("RoPE inv_freq provided but head_dim is 0."); }
+        if params.head_dim > 0 && freqs.len() * 2 != params.head_dim {
+            panic!("RoPE inv_freq length ({}) * 2 does not match head_dim ({}).", freqs.len(), params.head_dim);
         }
     }
 
-    let mut output;
-    if in_features_input == 0 {
-        // Input [N,0], Weight [M,0]. W^T is [0,M]. Output is [N,M] of zeros.
-        output = vec![vec![0.0; out_features]; n_input_rows];
-    } else {
-        let weight_t = transpose(weight);
-        output = matmul(input, &weight_t);
+    let q_projected = linear_projection(x_q, &params.w_q, params.b_q.as_ref());
+    let k_projected = linear_projection(x_kv, &params.w_k, params.b_k.as_ref());
+    let v_projected = linear_projection(x_kv, &params.w_v, params.b_v.as_ref());
+
+    let q_heads_vec = split_into_heads(&q_projected, params.num_heads);
+    let k_heads_vec = split_into_heads(&k_projected, params.num_heads);
+    let v_heads_vec = split_into_heads(&v_projected, params.num_heads);
+
+    let mut head_outputs: Vec<Matrix> = Vec::with_capacity(params.num_heads);
+
+    for h_idx in 0..params.num_heads {
+        let mut q_h_owned = q_heads_vec[h_idx].clone();
+        let mut k_h_owned = k_heads_vec[h_idx].clone();
+
+        let q_h_to_use: &Matrix;
+        let k_h_to_use: &Matrix;
+
+        if inv_freq.is_some() && params.head_dim > 0 {
+            let mut q_h_batch_like = vec![q_h_owned];
+            rope_utils::apply_rotary_pos_emb(&mut q_h_batch_like, inv_freq.unwrap(), position_offset);
+            q_h_owned = q_h_batch_like.remove(0);
+            q_h_to_use = &q_h_owned;
+
+            let mut k_h_batch_like = vec![k_h_owned];
+            rope_utils::apply_rotary_pos_emb(&mut k_h_batch_like, inv_freq.unwrap(), position_offset);
+            k_h_owned = k_h_batch_like.remove(0);
+            k_h_to_use = &k_h_owned;
+        } else {
+            q_h_to_use = &q_h_owned;
+            k_h_to_use = &k_h_owned;
+        }
+
+        let attention_output_h = scaled_dot_product_attention_simple(
+            q_h_to_use,
+            k_h_to_use,
+            &v_heads_vec[h_idx],
+            attention_mask,
+            None, // RoPE already applied at head level
+            0,    // Position offset already applied at head level
+            _dropout_p,
+        );
+        head_outputs.push(attention_output_h);
     }
 
-    if let Some(b) = bias {
-        if b.len() != out_features {
-            panic!("Bias dimension ({}) does not match out_features ({}).", b.len(), out_features);
-        }
-        if n_input_rows > 0 && out_features > 0 {
-            for i in 0..n_input_rows {
-                for j in 0..out_features {
-                    output[i][j] += b[j];
-                }
-            }
-        }
-    }
+    let concatenated_output = concatenate_heads(&head_outputs);
+    let output = linear_projection(&concatenated_output, &params.w_o, params.b_o.as_ref());
+
     output
 }
 
@@ -274,7 +425,11 @@ mod tests {
 
         if a_is_effectively_empty && b_is_effectively_empty { return; }
         if a_is_effectively_empty || b_is_effectively_empty {
-            panic!("One matrix is effectively empty, the other is not. A: {:?}, B: {:?}", a, b);
+            if !(a.iter().all(Vec::is_empty) && b.is_empty() && b.iter().all(Vec::is_empty)) &&
+               !(b.iter().all(Vec::is_empty) && a.is_empty() && a.iter().all(Vec::is_empty)) {
+                 assert_eq!(a,b, "Matrices with different empty structures are not equal unless both represent zero elements. A: {:?}, B: {:?}",a,b);
+             }
+             return;
         }
 
         for i in 0..a.len() {
@@ -364,20 +519,19 @@ mod tests {
         assert_eq!(res_2x0.len(), 2);
         if !res_2x0.is_empty() { assert!(res_2x0[0].is_empty()); }
 
-
         let a_0xN: Matrix = Vec::new();
         let b_NxP: Matrix = vec![vec![1.0,2.0], vec![3.0,4.0]];
         let res_0xP = matmul(&a_0xN, &b_NxP);
         assert!(res_0xP.is_empty());
 
-        let a_Mx0: Matrix = vec![vec![], vec![]]; // 2x0
-        let b_0xP_empty: Matrix = Vec::new(); // 0xP represented as empty
-        let res_Mx0_from_empty_B = matmul(&a_Mx0, &b_0xP_empty); // 2x0 @ 0x0 -> 2x0
+        let a_Mx0: Matrix = vec![vec![], vec![]];
+        let b_0xP_empty: Matrix = Vec::new();
+        let res_Mx0_from_empty_B = matmul(&a_Mx0, &b_0xP_empty);
         assert_eq!(res_Mx0_from_empty_B.len(), 2);
         if !res_Mx0_from_empty_B.is_empty() { assert!(res_Mx0_from_empty_B[0].is_empty()); }
 
-        let b_0x3_explicit: Matrix = vec![vec![0.0;3];0]; // Explicit 0x3, also Vec::new()
-        let res_MxP_zeros = matmul(&a_Mx0, &b_0x3_explicit); // 2x0 @ 0x0 (p becomes 0) -> 2x0
+        let b_0x3_explicit: Matrix = vec![vec![0.0;3];0];
+        let res_MxP_zeros = matmul(&a_Mx0, &b_0x3_explicit);
         assert_eq!(res_MxP_zeros.len(), 2);
         if !res_MxP_zeros.is_empty() { assert!(res_MxP_zeros[0].is_empty()); }
     }
@@ -573,9 +727,9 @@ mod tests {
 
     #[test]
     fn test_linear_projection_in_features_zero() {
-        let input = vec![vec![], vec![]]; // 2x0
-        let weight = vec![vec![], vec![], vec![]]; // 3x0
-        let bias = Some(vec![1.0, 2.0, 3.0]); // Bias for 3 out_features
+        let input = vec![vec![], vec![]];
+        let weight = vec![vec![], vec![], vec![]];
+        let bias = Some(vec![1.0, 2.0, 3.0]);
         let expected = vec![vec![1.0, 2.0, 3.0], vec![1.0, 2.0, 3.0]];
         let output = linear_projection(&input, &weight, bias.as_ref().map(|v| v));
         assert_matrix_approx_eq(&output, &expected, 1e-7);
@@ -587,10 +741,10 @@ mod tests {
 
     #[test]
     fn test_linear_projection_out_features_zero() {
-        let input = vec![vec![1.0, 2.0]]; // 1x2
-        let weight_0_x_2: Matrix = Vec::new(); // Represents 0x2 weight
+        let input = vec![vec![1.0, 2.0]];
+        let weight_0_x_2: Matrix = Vec::new();
         let bias_empty: Option<Vector> = Some(Vec::new());
-        let expected_1_x_0: Matrix = vec![vec![]]; // 1x0
+        let expected_1_x_0:Matrix = vec![vec![]];
 
         let output = linear_projection(&input, &weight_0_x_2, bias_empty.as_ref());
         assert_matrix_approx_eq(&output, &expected_1_x_0, 1e-7);
@@ -630,5 +784,135 @@ mod tests {
         let input = vec![vec![1.0, 2.0]];
         let weight = vec![vec![1.0, 0.0], vec![0.0]];
         linear_projection(&input, &weight, None);
+    }
+
+    // --- Tests for MHA Helper Functions ---
+    #[test]
+    fn test_split_into_heads_basic() {
+        let combined = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ];
+        let num_heads = 3;
+        let heads = split_into_heads(&combined, num_heads);
+        assert_eq!(heads.len(), num_heads);
+        assert_eq!(heads[0], vec![vec![1.0, 2.0], vec![7.0, 8.0]]);
+        assert_eq!(heads[1], vec![vec![3.0, 4.0], vec![9.0, 10.0]]);
+        assert_eq!(heads[2], vec![vec![5.0, 6.0], vec![11.0, 12.0]]);
+    }
+
+    #[test]
+    fn test_split_into_heads_head_dim_1() {
+        let combined = vec![ vec![1.0, 2.0, 3.0], vec![4.0, 5.0, 6.0]];
+        let num_heads = 3;
+        let heads = split_into_heads(&combined, num_heads);
+        assert_eq!(heads.len(), num_heads);
+        assert_eq!(heads[0], vec![vec![1.0], vec![4.0]]);
+        assert_eq!(heads[1], vec![vec![2.0], vec![5.0]]);
+        assert_eq!(heads[2], vec![vec![3.0], vec![6.0]]);
+    }
+
+    #[test]
+    fn test_split_into_heads_seq_len_zero() {
+        let combined: Matrix = Vec::new();
+        let num_heads = 2;
+        let heads = split_into_heads(&combined, num_heads);
+        assert_eq!(heads.len(), num_heads);
+        assert!(heads[0].is_empty());
+        assert!(heads[1].is_empty());
+    }
+
+    #[test]
+    fn test_split_into_heads_combined_dim_zero() {
+        let combined = vec![vec![], vec![]];
+        let num_heads = 2;
+        let heads = split_into_heads(&combined, num_heads);
+        assert_eq!(heads.len(), num_heads);
+        assert_eq!(heads[0], vec![vec![], vec![]]);
+        assert_eq!(heads[1], vec![vec![], vec![]]);
+    }
+
+    #[test]
+    #[should_panic(expected = "num_heads cannot be zero.")]
+    fn test_split_into_heads_panic_zero_heads() {
+        split_into_heads(&vec![vec![1.0]], 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "Combined dimension (5) is not divisible by num_heads (2).")]
+    fn test_split_into_heads_panic_not_divisible() {
+        split_into_heads(&vec![vec![1.0,2.0,3.0,4.0,5.0]], 2);
+    }
+
+    #[test]
+    #[should_panic(expected = "Head dimension would be zero because num_heads (3) > combined_dim (2).")]
+    fn test_split_into_heads_panic_head_dim_zero_implicitly() {
+        split_into_heads(&vec![vec![1.0,2.0]], 3);
+    }
+
+    #[test]
+    fn test_concatenate_heads_basic() {
+        let heads = vec![
+            vec![vec![1.0, 2.0], vec![7.0, 8.0]],
+            vec![vec![3.0, 4.0], vec![9.0, 10.0]],
+            vec![vec![5.0, 6.0], vec![11.0, 12.0]],
+        ];
+        let combined = concatenate_heads(&heads);
+        let expected = vec![
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+        ];
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn test_concatenate_heads_head_dim_1() {
+        let heads = vec![
+            vec![vec![1.0], vec![4.0]],
+            vec![vec![2.0], vec![5.0]],
+            vec![vec![3.0], vec![6.0]],
+        ];
+        let combined = concatenate_heads(&heads);
+        let expected = vec![
+            vec![1.0, 2.0, 3.0],
+            vec![4.0, 5.0, 6.0],
+        ];
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn test_concatenate_heads_empty_input_vec() {
+        let heads: Vec<Matrix> = Vec::new();
+        let combined = concatenate_heads(&heads);
+        assert!(combined.is_empty());
+    }
+
+    #[test]
+    fn test_concatenate_heads_seq_len_zero() {
+        let heads: Vec<Matrix> = vec![Vec::new(), Vec::new()];
+        let combined = concatenate_heads(&heads);
+        assert!(combined.is_empty());
+    }
+
+    #[test]
+    fn test_concatenate_heads_head_dim_zero() {
+        let heads: Vec<Matrix> = vec![ vec![vec![], vec![]], vec![vec![], vec![]] ];
+        let combined = concatenate_heads(&heads);
+        let expected = vec![vec![], vec![]];
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "Head 1 has inconsistent seq_len: expected 2, got 1.")]
+    fn test_concatenate_heads_panic_inconsistent_seq_len() {
+        let heads = vec![ vec![vec![1.0], vec![2.0]], vec![vec![3.0]] ];
+        concatenate_heads(&heads);
+    }
+
+    #[test]
+    #[should_panic(expected = "Head 0 at seq_idx 1 has inconsistent head_dim: expected 1, got 2.")]
+    fn test_concatenate_heads_panic_inconsistent_head_dim() {
+        let heads = vec![ vec![vec![1.0], vec![2.0, 3.0]] ];
+        concatenate_heads(&heads);
     }
 }
